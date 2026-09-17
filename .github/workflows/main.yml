@@ -58,9 +58,11 @@ jobs:
           ssh \
             -i ~/.ssh/erp_deploy_key \
             "${{ secrets.AWS_USER }}@${{ secrets.AWS_HOST }}" \
-            'bash -s' <<'REMOTE_SCRIPT'
+            'sudo bash -s' <<'REMOTE_SCRIPT'
 
           set -Eeuo pipefail
+
+          export PATH="/root/.nvm/versions/node/v20.20.2/bin:$PATH"
 
           APP_NAME="erp-backend"
           LIVE_DIR="/data/projects/erp/backend"
