@@ -1,0 +1,31 @@
+{
+  "name": "erp-backend",
+  "version": "0.1.0",
+  "description": "Generalized multi-tenant ERP backend (Express)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "seed": "node scripts/seed_master_demo.js",
+    "migrate-tenants:status": "node scripts/migrateTenantsStatus.js",
+    "migrate-tenants:upgrade": "node scripts/migrateTenantsUpgrade.js",
+    "setup:master": "node scripts/setup_master_db.js",
+    "clean:local": "node scripts/clean_local_db.js"
+  },
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.20.0",
+    "bcrypt": "^6.0.0",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "express-validator": "^7.3.2",
+    "jsonwebtoken": "^9.0.3",
+    "mysql2": "^3.23.3",
+    "node-fetch": "^3.3.2",
+    "pdfkit": "^0.19.1",
+    "ws": "^8.18.3"
+  }
+}
