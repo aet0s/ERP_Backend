@@ -84,4 +84,4 @@ jobs:
             -o StrictHostKeyChecking=yes \
             -i ~/.ssh/erp_deploy_key \
             "${{ secrets.AWS_USER }}@${{ secrets.AWS_HOST }}" \
-            "sudo -n /usr/local/bin/deploy-erp-backend"
+            "sudo -n /data/deploy/scripts/deploy-erp-backend"
