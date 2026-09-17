@@ -27,7 +27,7 @@ jobs:
             --exclude='.git' \
             --exclude='node_modules' \
             --exclude='.env' \
-            -czf backend-release.tar.gz .
+            -czf /tmp/backend-release.tar.gz .
 
       # ----------------------------------------
       # 3. Configure SSH
@@ -47,7 +47,7 @@ jobs:
         run: |
           scp \
             -i ~/.ssh/erp_deploy_key \
-            backend-release.tar.gz \
+            /tmp/backend-release.tar.gz \
             "${{ secrets.AWS_USER }}@${{ secrets.AWS_HOST }}:/tmp/backend-release.tar.gz"
 
       # ----------------------------------------
