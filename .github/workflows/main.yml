@@ -12,15 +12,18 @@ jobs:
 
     steps:
 
-      # ----------------------------------------
-      # 1. Checkout exact commit
-      # ----------------------------------------
+      # ============================================================
+      # 1. Checkout the exact commit that triggered this deployment
+      # ============================================================
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ----------------------------------------
+      # ============================================================
       # 2. Create deployment package
-      # ----------------------------------------
+      #
+      # .env is excluded because production .env lives on AWS.
+      # node_modules is excluded because AWS will run npm ci.
+      # ============================================================
       - name: Create deployment package
         run: |
           tar \
@@ -29,209 +32,56 @@ jobs:
             --exclude='.env' \
             -czf /tmp/backend-release.tar.gz .
 
-      # ----------------------------------------
+          echo "Deployment package created:"
+          ls -lh /tmp/backend-release.tar.gz
+
+      # ============================================================
       # 3. Configure SSH
-      # ----------------------------------------
+      # ============================================================
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
+
           echo "${{ secrets.AWS_SSH_KEY }}" > ~/.ssh/erp_deploy_key
+
           chmod 600 ~/.ssh/erp_deploy_key
 
           ssh-keyscan -H "${{ secrets.AWS_HOST }}" >> ~/.ssh/known_hosts
 
-      # ----------------------------------------
-      # 4. Upload release to AWS
-      # ----------------------------------------
+      # ============================================================
+      # 4. Upload deployment package to AWS
+      # ============================================================
       - name: Upload release
         run: |
           scp \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
             -i ~/.ssh/erp_deploy_key \
             /tmp/backend-release.tar.gz \
             "${{ secrets.AWS_USER }}@${{ secrets.AWS_HOST }}:/tmp/backend-release.tar.gz"
 
-      # ----------------------------------------
-      # 5. Deploy on AWS
-      # ----------------------------------------
+          echo "Release uploaded successfully."
+
+      # ============================================================
+      # 5. Run deployment script on AWS
+      #
+      # The deployment script on AWS handles:
+      #
+      # - Backup current backend
+      # - Extract new release
+      # - Preserve production .env
+      # - npm ci
+      # - Node syntax check
+      # - Switch application
+      # - PM2 restart
+      # - Health check
+      # - Rollback if health check fails
+      # ============================================================
       - name: Deploy on AWS
         run: |
           ssh \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
             -i ~/.ssh/erp_deploy_key \
             "${{ secrets.AWS_USER }}@${{ secrets.AWS_HOST }}" \
-            'sudo bash -s' <<'REMOTE_SCRIPT'
-
-          set -Eeuo pipefail
-
-          export PATH="/root/.nvm/versions/node/v20.20.2/bin:$PATH"
-
-          APP_NAME="erp-backend"
-          LIVE_DIR="/data/projects/erp/backend"
-          BACKUP_ROOT="/data/deploy/erp-backend/backups"
-
-          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          BACKUP_DIR="$BACKUP_ROOT/$TIMESTAMP"
-          NEW_DIR="/tmp/erp-backend-$TIMESTAMP"
-
-          echo "=========================================="
-          echo "ERP BACKEND DEPLOYMENT"
-          echo "Release: $TIMESTAMP"
-          echo "=========================================="
-
-          mkdir -p "$BACKUP_DIR"
-          mkdir -p "$NEW_DIR"
-
-          # ------------------------------------
-          # 1. Backup current application
-          # ------------------------------------
-
-          echo "[1/7] Backing up current backend..."
-
-          if [ -d "$LIVE_DIR" ]; then
-              tar \
-                --exclude='node_modules' \
-                --exclude='.git' \
-                -czf "$BACKUP_DIR/backend.tar.gz" \
-                -C "$(dirname "$LIVE_DIR")" \
-                "$(basename "$LIVE_DIR")"
-
-              echo "Backup created:"
-              echo "$BACKUP_DIR/backend.tar.gz"
-          fi
-
-          # ------------------------------------
-          # 2. Extract new release
-          # ------------------------------------
-
-          echo "[2/7] Extracting new release..."
-
-          tar -xzf /tmp/backend-release.tar.gz -C "$NEW_DIR"
-
-          # ------------------------------------
-          # 3. Preserve production .env
-          # ------------------------------------
-
-          echo "[3/7] Preserving production .env..."
-
-          if [ -f "$LIVE_DIR/.env" ]; then
-              cp "$LIVE_DIR/.env" "$NEW_DIR/.env"
-          else
-              echo "ERROR: Production .env does not exist."
-              exit 1
-          fi
-
-          # ------------------------------------
-          # 4. Install dependencies
-          # ------------------------------------
-
-          echo "[4/7] Installing dependencies..."
-
-          cd "$NEW_DIR"
-
-          npm ci --omit=dev
-
-          # ------------------------------------
-          # 5. Validate Node application
-          # ------------------------------------
-
-          echo "[5/7] Validating application..."
-
-          node --check index.js
-
-          # ------------------------------------
-          # 6. Replace application
-          # ------------------------------------
-
-          echo "[6/7] Replacing current application..."
-
-          OLD_DIR="${LIVE_DIR}.old-$TIMESTAMP"
-
-          if [ -d "$LIVE_DIR" ]; then
-              mv "$LIVE_DIR" "$OLD_DIR"
-          fi
-
-          mv "$NEW_DIR" "$LIVE_DIR"
-
-          echo "Restarting PM2..."
-
-          pm2 restart "$APP_NAME"
-
-          sleep 5
-
-          # ------------------------------------
-          # 7. Health check
-          # ------------------------------------
-
-          echo "[7/7] Running health check..."
-
-          PM2_STATUS=$(pm2 jlist | node -e "
-          let data='';
-          process.stdin.on('data',d=>data+=d);
-          process.stdin.on('end',()=>{
-            const apps=JSON.parse(data);
-            const app=apps.find(x=>x.name==='erp-backend');
-            console.log(app ? app.pm2_env.status : 'NOT_FOUND');
-          });
-          ")
-
-          HTTP_STATUS=$(curl \
-            -s \
-            -o /dev/null \
-            -w "%{http_code}" \
-            --max-time 10 \
-            http://127.0.0.1:4000/ || true)
-
-          echo "PM2 status: $PM2_STATUS"
-          echo "HTTP status: $HTTP_STATUS"
-
-          # Express currently returns 404 for /
-          # A 404 still proves Node/Express is responding.
-          if [ "$PM2_STATUS" = "online" ] && \
-             [ "$HTTP_STATUS" -ge 200 ] && \
-             [ "$HTTP_STATUS" -lt 500 ]; then
-
-              echo "=========================================="
-              echo "DEPLOYMENT SUCCESSFUL"
-              echo "=========================================="
-
-              rm -rf "$OLD_DIR"
-
-              # Keep only latest 5 backups
-              ls -1dt "$BACKUP_ROOT"/* 2>/dev/null \
-                | tail -n +6 \
-                | xargs -r rm -rf
-
-              rm -f /tmp/backend-release.tar.gz
-
-              exit 0
-
-          else
-
-              echo "=========================================="
-              echo "DEPLOYMENT FAILED"
-              echo "ROLLING BACK"
-              echo "=========================================="
-
-              pm2 stop "$APP_NAME" || true
-
-              rm -rf "$LIVE_DIR"
-
-              if [ -d "$OLD_DIR" ]; then
-                  mv "$OLD_DIR" "$LIVE_DIR"
-              else
-                  echo "ERROR: Previous application directory not found."
-                  exit 1
-              fi
-
-              pm2 restart "$APP_NAME" || true
-
-              sleep 5
-
-              echo "Rollback completed."
-
-              rm -f /tmp/backend-release.tar.gz
-
-              exit 1
-
-          fi
-
-          REMOTE_SCRIPT
+            "sudo -n /usr/local/bin/deploy-erp-backend"
