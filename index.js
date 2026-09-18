@@ -63,6 +63,12 @@ app.use('/api/webhooks', require('./routes/webhooks'));
 
 app.use(bodyParser.json({ limit: '2mb' }));
 
+// Public Health Check Endpoints (Root URL, /health, /api/health)
+const { healthCheckHandler } = require('./routes/health');
+app.get('/', healthCheckHandler);
+app.get('/health', healthCheckHandler);
+app.get('/api/health', healthCheckHandler);
+
 // -- Route groups --
 app.use('/auth', require('./routes/auth'));
 app.use('/api/billing', require('./routes/billing'));
