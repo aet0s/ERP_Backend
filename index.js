@@ -108,6 +108,9 @@ app.use('/customer-portal/api', require('./routes/customerPortal'));
 
 // Centralized Error Handler
 app.use((err, req, res, next) => {
+  if (err.type === 'entity.too.large' || err.status === 413) {
+    return res.status(413).json({ error: 'Payload too large: maximum allowed request body size is 2MB' });
+  }
   const companyId = req.user?.company_id || req.user?.workspace_id || 'anonymous';
   const errMsg = (err && err.message) ? err.message : String(err || 'Internal server error');
   const errStack = (err && err.stack) ? err.stack : '';

@@ -36,7 +36,7 @@ function requireAnyPermission(modules, action = 'view') {
 // ─────────────────────────────────────────────────────────────────────────────
 // LIST PRODUCTION ORDERS
 // ─────────────────────────────────────────────────────────────────────────────
-router.get('/production-orders', requireAuth, requireAnyPermission(['production', 'shift_log'], 'view'), async (req, res) => {
+router.get('/production-orders', requireAuth, requirePermission('production', 'view'), async (req, res) => {
   try {
     const conditions = ['po.deleted_at IS NULL'];
     const params = [];
@@ -261,7 +261,7 @@ router.get('/production-orders', requireAuth, requireAnyPermission(['production'
 // ─────────────────────────────────────────────────────────────────────────────
 // LIST ALL SHIFT LOGS (Paginated global shift logs across all orders)
 // ─────────────────────────────────────────────────────────────────────────────
-router.get('/production-shift-logs', requireAuth, requirePermission('shift_log', 'view'), async (req, res) => {
+const listShiftLogsHandler = async (req, res) => {
   try {
     const isExport = req.query.export === 'true' || req.query.limit === 'all' || req.query.all === 'true';
     const page = Math.max(1, parseInt(req.query.page || '1', 10));
@@ -345,12 +345,16 @@ router.get('/production-shift-logs', requireAuth, requirePermission('shift_log',
     console.error('list shift logs error', err);
     return res.status(500).json({ error: 'Failed to fetch shift logs' });
   }
-});
+};
+
+router.get('/production-shift-logs', requireAuth, requirePermission('shift_log', 'view'), listShiftLogsHandler);
+router.get('/shift-log', requireAuth, requirePermission('shift_log', 'view'), listShiftLogsHandler);
+router.get('/shift-logs', requireAuth, requirePermission('shift_log', 'view'), listShiftLogsHandler);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PRODUCTION STATS SUMMARY (for Floor KPI widgets)
 // ─────────────────────────────────────────────────────────────────────────────
-router.get('/production-orders/stats', requireAuth, requireAnyPermission(['production', 'shift_log'], 'view'), async (req, res) => {
+router.get('/production-orders/stats', requireAuth, requirePermission('production', 'view'), async (req, res) => {
   try {
     const activeRes = await req.tenantDb.query(
       `SELECT COUNT(id) AS active_count
@@ -395,7 +399,7 @@ router.get('/production-orders/stats', requireAuth, requireAnyPermission(['produ
 // ─────────────────────────────────────────────────────────────────────────────
 // FILTER OPTIONS (Distinct products, formulas, and operators for shop floor filters)
 // ─────────────────────────────────────────────────────────────────────────────
-router.get('/production-orders/filter-options', requireAuth, requireAnyPermission(['production', 'shift_log'], 'view'), async (req, res) => {
+router.get('/production-orders/filter-options', requireAuth, requirePermission('production', 'view'), async (req, res) => {
   try {
     const productsRes = await req.tenantDb.query(`
       SELECT DISTINCT item_id AS id, item_name AS name, item_unit AS unit
@@ -446,7 +450,7 @@ router.get('/production-orders/filter-options', requireAuth, requireAnyPermissio
 // ─────────────────────────────────────────────────────────────────────────────
 // GET ONE PRODUCTION ORDER WITH SHIFT LOGS
 // ─────────────────────────────────────────────────────────────────────────────
-router.get('/production-orders/:id', requireAuth, requireAnyPermission(['production', 'shift_log'], 'view'), async (req, res) => {
+router.get('/production-orders/:id', requireAuth, requirePermission('production', 'view'), async (req, res) => {
   try {
     const orderRes = await req.tenantDb.query(
       `SELECT po.*,
@@ -1039,7 +1043,7 @@ async function requireShiftLogDelete(req, res, next) {
   try {
     const placeholders = userRoles.map(() => '?').join(',');
     const permRes = await req.tenantDb.query(
-      `SELECT MAX(can_delete) AS allowed FROM role_permissions WHERE role IN (${placeholders}) AND module IN ('shift_log', 'production')`,
+      `SELECT MAX(can_delete) AS allowed FROM role_permissions WHERE role IN (${placeholders}) AND module = 'shift_log'`,
       userRoles
     );
     if (permRes.rows[0]?.allowed === 1 || permRes.rows[0]?.allowed === true) return next();

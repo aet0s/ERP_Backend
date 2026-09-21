@@ -888,7 +888,7 @@ router.post('/items', requireAuth, requirePermission('catalog', 'create'), async
     await syncNumberingSeries(req.tenantDb, 'item', itemCode);
     const existingCode = await req.tenantDb.query('SELECT id FROM items WHERE code = ? AND deleted_at IS NULL', [itemCode]);
     if (existingCode.rowCount > 0) {
-      itemCode = `${itemCode}-${Date.now().toString().slice(-4)}`;
+      return res.status(409).json({ error: `Item code '${itemCode}' already exists in catalog` });
     }
 
     const id = crypto.randomUUID();

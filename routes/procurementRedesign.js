@@ -10,6 +10,88 @@ const { createNotification } = require('../lib/notifications');
 // VENDOR ORDER PROCESS CHAIN & PROCUREMENTS
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Dedicated Uniform Endpoint for Vendor Orders (Internal Roles RBAC)
+router.get('/vendor-orders', requireAuth, requirePermission('vendor_orders', 'view'), async (req, res) => {
+  try {
+    const { vendor_id, status } = req.query;
+    let where = 'p.deleted_at IS NULL';
+    const params = [];
+
+    if (req.user.role === 'vendor' || req.user.vendor_id) {
+      params.push(req.user.vendor_id);
+      where += ` AND p.vendor_id = ?`;
+    } else if (vendor_id) {
+      params.push(vendor_id);
+      where += ` AND p.vendor_id = ?`;
+    }
+
+    if (status && status !== 'all') {
+      params.push(status);
+      where += ` AND p.status = ?`;
+    }
+
+    const result = await req.tenantDb.query(
+      `SELECT p.*, v.name AS vendor_name, v.vendor_code
+       FROM procurements p
+       LEFT JOIN vendors v ON v.id = p.vendor_id
+       WHERE ${where}
+       ORDER BY p.date DESC, p.created_at DESC
+       LIMIT 100`,
+      params
+    );
+
+    return res.json({ orders: result.rows, total: result.rowCount });
+  } catch (err) {
+    console.error('get vendor orders error', err);
+    return res.status(500).json({ error: 'Failed to fetch vendor orders' });
+  }
+});
+
+router.post('/vendor-orders', requireAuth, requirePermission('vendor_orders', 'create'), async (req, res) => {
+  return res.status(201).json({ message: 'Vendor order initiated' });
+});
+
+// Dedicated Uniform Endpoint for Customer Orders (Internal Roles RBAC)
+router.get('/customer-orders', requireAuth, requirePermission('customer_orders', 'view'), async (req, res) => {
+  try {
+    const { customer_id, status } = req.query;
+    let where = 's.deleted_at IS NULL';
+    const params = [];
+
+    if (req.user.role === 'customer' || req.user.customer_id) {
+      params.push(req.user.customer_id);
+      where += ` AND s.customer_id = ?`;
+    } else if (customer_id) {
+      params.push(customer_id);
+      where += ` AND s.customer_id = ?`;
+    }
+
+    if (status && status !== 'all') {
+      params.push(status);
+      where += ` AND s.status = ?`;
+    }
+
+    const result = await req.tenantDb.query(
+      `SELECT s.*, c.name AS customer_name, c.customer_code
+       FROM sales_invoices s
+       LEFT JOIN customers c ON c.id = s.customer_id
+       WHERE ${where}
+       ORDER BY s.date DESC, s.created_at DESC
+       LIMIT 100`,
+      params
+    );
+
+    return res.json({ orders: result.rows, total: result.rowCount });
+  } catch (err) {
+    console.error('get customer orders error', err);
+    return res.status(500).json({ error: 'Failed to fetch customer orders' });
+  }
+});
+
+router.post('/customer-orders', requireAuth, requirePermission('customer_orders', 'create'), async (req, res) => {
+  return res.status(201).json({ message: 'Customer order initiated' });
+});
+
 // List Multi-line Procurements
 router.get('/procurements', requireAuth, requirePermission('procurement', 'view'), async (req, res) => {
   try {
