@@ -7,6 +7,7 @@ const { queryMaster } = require('../db/masterDb');
 const { getTenantPool } = require('../db/tenantManager');
 const authRoute = require('./auth');
 const { issueAccessToken, buildRefreshToken, persistRefreshToken, setAuthCookies, parseRoles } = authRoute;
+const { getFrontendBaseUrl } = require('../lib/urlUtils');
 
 const BCRYPT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || '12', 10);
 const VALID_ROLES = ['owner', 'admin', 'manager', 'accounts', 'production_manager', 'sales_manager', 'staff'];
@@ -453,7 +454,7 @@ router.post('/invites', requireAuth, requirePermission('users', 'create'), async
       ).catch(() => {});
     }
 
-    const base = process.env.FRONTEND_URL || 'http://localhost:5173';
+    const base = getFrontendBaseUrl(req);
     return res.status(201).json({ ...inviteRecord, signup_link: `${base}/accept-invite?token=${token}` });
   } catch (err) {
     console.error('create invite error', err);
@@ -506,7 +507,7 @@ router.get('/invites/:id', requireAuth, requirePermission('users', 'view'), asyn
     }
 
     const invite = inviteRes.rows[0];
-    const base = process.env.FRONTEND_URL || 'http://localhost:5173';
+    const base = getFrontendBaseUrl(req);
     return res.json({
       ...invite,
       invite_link: invite.token ? `${base}/accept-invite?token=${invite.token}` : ''

@@ -16,6 +16,7 @@ const { getTenantPool } = require('../db/tenantManager');
 const { createNotification } = require('../lib/notifications');
 const { calculateInvoiceLine, calculateInvoiceTotals, getNextDocumentNumber } = require('../lib/invoiceEngine');
 const { publishReturnRequestMessage } = require('../lib/returnRequestSocket');
+const { getFrontendBaseUrl } = require('../lib/urlUtils');
 
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error('FATAL: JWT_SECRET environment variable is not configured');
@@ -2756,7 +2757,7 @@ router.post('/vendors/:id/portal-invite', requireAuth, requirePermission('partie
       [globalUser.id, companyId, 'vendor']
     );
 
-    const base = process.env.FRONTEND_URL || 'http://localhost:5173';
+    const base = getFrontendBaseUrl(req);
 
     const forceReinvite = Boolean(req.body.force_reinvite || req.body.reset_password);
 
@@ -3090,7 +3091,7 @@ router.post('/vendor-portal/auth/forgot-password', async (req, res) => {
       [globalUser.id]
     );
 
-    const base = process.env.FRONTEND_URL || 'http://localhost:5173';
+    const base = getFrontendBaseUrl(req);
     const resetLink = `${base}/vendor-portal/reset-password?token=${resetToken}&email=${encodeURIComponent(globalUser.email)}`;
 
     return res.json({
@@ -3420,7 +3421,7 @@ router.post('/customers/:id/portal-invite', requireAuth, requirePermission('part
       [globalUser.id, companyId, 'customer']
     );
 
-    const base = process.env.FRONTEND_URL || 'http://localhost:5173';
+    const base = getFrontendBaseUrl(req);
     const forceReinvite = Boolean(req.body.force_reinvite || req.body.reset_password);
 
     if (!forceReinvite && existingMembership.rowCount > 0 && existingMembership.rows[0].status === 'Active') {
@@ -3532,7 +3533,7 @@ router.post('/customer-portal/auth/forgot-password', async (req, res) => {
     const resetToken = crypto.randomBytes(32).toString('hex');
     const resetExpires = new Date(Date.now() + 2 * 60 * 60 * 1000);
 
-    const base = process.env.FRONTEND_URL || 'http://localhost:5173';
+    const base = getFrontendBaseUrl(req);
     const resetLink = `${base}/customer-portal/reset-password?token=${resetToken}&email=${encodeURIComponent(globalUser.email)}`;
 
     return res.json({

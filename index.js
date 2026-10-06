@@ -25,6 +25,8 @@ const PORT = process.env.PORT || 4000;
 const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:5174",
+  "https://erp.solarman.in",
+  "http://erp.solarman.in",
   "https://erp-gamma-beryl.vercel.app",
   "https://lams.solarman.in",
   "http://lams.solarman.in",
