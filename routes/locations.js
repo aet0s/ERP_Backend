@@ -7,6 +7,7 @@ const { requireAuth, requireRole, requirePermission } = require('../middleware/a
 const { getNextDocumentNumber, syncNumberingSeries } = require('../lib/invoiceEngine');
 
 const { queryMaster } = require('../db/masterDb');
+const { getInventorySnapshot } = require('../lib/analytics');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LOCATIONS MASTER
@@ -92,6 +93,83 @@ router.get('/locations/:id', requireAuth, requirePermission('locations', 'view')
     );
 
     loc.stock_item_count = stockRes.rowCount;
+
+    // Detailed stock items stored at this location
+    const itemsRes = await req.tenantDb.query(
+      `SELECT il.item_type, il.item_id,
+              COALESCE(i.name, fg.name, rm.name, 'Warehouse Item') AS item_name,
+              COALESCE(i.code, fg.hsn_code, '') AS code,
+              COALESCE(i.unit, fg.unit, rm.unit, 'units') AS unit,
+              SUM(CASE WHEN il.transaction_type = 'in' THEN il.quantity
+                       WHEN il.transaction_type = 'out' THEN -il.quantity
+                       ELSE il.quantity END) AS quantity
+       FROM inventory_ledger il
+       LEFT JOIN items i ON i.id = il.item_id
+       LEFT JOIN finished_goods fg ON fg.id = il.item_id
+       LEFT JOIN raw_materials rm ON rm.id = il.item_id
+       WHERE il.location_id = ?
+       GROUP BY il.item_type, il.item_id, item_name, code, unit
+       HAVING quantity > 0
+       ORDER BY quantity DESC`,
+      [req.params.id]
+    );
+
+    // Fetch inventory snapshot for this location to resolve exact WAC costs, selling prices, and packaging
+    const snapshot = await getInventorySnapshot(req.tenantDb, req.params.id).catch(() => []);
+    const snapMap = {};
+    for (const s of snapshot) {
+      snapMap[`${s.item_type}:${s.item_id}`] = s;
+    }
+
+    // Fallbacks from finished_goods and inventory_ledger
+    const [fgPricesRes, ledgerCostRes] = await Promise.all([
+      req.tenantDb.query('SELECT id, default_price, base_selling_price FROM finished_goods WHERE deleted_at IS NULL').catch(() => ({ rows: [] })),
+      req.tenantDb.query(`
+        SELECT item_type, item_id,
+               SUM(CASE WHEN transaction_type = 'in' AND unit_cost > 0 THEN quantity * unit_cost ELSE 0 END) /
+               NULLIF(SUM(CASE WHEN transaction_type = 'in' AND unit_cost > 0 THEN quantity ELSE 0 END), 0) AS wac_cost,
+               MAX(CASE WHEN unit_cost > 0 THEN unit_cost ELSE 0 END) AS latest_cost
+        FROM inventory_ledger
+        WHERE (location_id = ? OR location_id IS NULL) AND unit_cost > 0
+        GROUP BY item_type, item_id
+      `, [req.params.id]).catch(() => ({ rows: [] }))
+    ]);
+
+    const fgPriceMap = {};
+    for (const fg of fgPricesRes.rows) {
+      fgPriceMap[fg.id] = Number(fg.default_price || fg.base_selling_price || 0);
+    }
+
+    const ledgerCostMap = {};
+    for (const lc of ledgerCostRes.rows) {
+      ledgerCostMap[`${lc.item_type}:${lc.item_id}`] = Number(lc.wac_cost || lc.latest_cost || 0);
+    }
+
+    loc.items = itemsRes.rows.map(r => {
+      const snap = snapMap[`${r.item_type}:${r.item_id}`];
+      const qty = Number(r.quantity || 0);
+      const unitCost = Number(snap?.unit_cost || ledgerCostMap[`${r.item_type}:${r.item_id}`] || 0);
+      const sellingPrice = Number(snap?.selling_price || fgPriceMap[r.item_id] || 0);
+      const rate = unitCost > 0 ? unitCost : (sellingPrice || 0);
+      const total = qty * rate;
+
+      return {
+        ...r,
+        name: r.item_name,
+        quantity: qty,
+        rate_per_unit: rate,
+        unit_cost: unitCost,
+        selling_price: sellingPrice,
+        line_total: total,
+        packaging_summary: snap?.packaging_summary || null,
+        packaged_stock: snap?.packaged_stock || null,
+        package_name: snap?.package_name || null,
+        package_unit: snap?.package_unit || null
+      };
+    });
+
+    loc.total_valuation = loc.items.reduce((sum, item) => sum + (item.line_total || 0), 0);
+
     return res.json(loc);
   } catch (err) {
     console.error('get location error', err);
@@ -287,7 +365,9 @@ router.get('/stock-transfers', requireAuth, requirePermission('stock_transfers',
        LEFT JOIN items i ON i.id = st.item_id
        LEFT JOIN raw_materials rm ON rm.id = st.item_id
        LEFT JOIN finished_goods fg ON fg.id = st.item_id
-       LEFT JOIN users u ON u.id = st.created_by`;
+       LEFT JOIN users u ON u.id = st.created_by
+       LEFT JOIN inventory_ledger il_out ON il_out.reference_table = 'stock_transfers' AND il_out.reference_id = st.id AND il_out.transaction_type = 'out'
+       LEFT JOIN product_packaging_levels ppl ON ppl.id = il_out.packaging_level_id`;
 
     let total = 0;
     if (isTable) {
@@ -303,7 +383,10 @@ router.get('/stock-transfers', requireAuth, requirePermission('stock_transfers',
              fl.name AS from_location_name, tl.name AS to_location_name,
              COALESCE(i.name, rm.name, fg.name) AS item_name,
              COALESCE(i.unit, rm.unit, fg.unit) AS item_unit,
-             u.name AS created_by_name
+             u.name AS created_by_name,
+             il_out.package_count,
+             ppl.package_unit,
+             ppl.name AS package_name
       FROM ${fromTable}
       WHERE ${where}
       ORDER BY st.created_at DESC
@@ -342,9 +425,160 @@ router.get('/stock-transfers', requireAuth, requirePermission('stock_transfers',
   }
 });
 
+// Fetch available items for stock transfer by item_type and optional location_id
+router.get('/stock-transfers/available-items', requireAuth, async (req, res) => {
+  try {
+    const { item_type = 'raw_material', location_id } = req.query;
+    let items = [];
+
+    if (item_type === 'raw_material') {
+      const q = `
+        SELECT rm.id, rm.name, rm.unit, COALESCE(i.code, '') AS code,
+               COALESCE((
+                 SELECT SUM(CASE WHEN il.transaction_type = 'in' THEN il.quantity ELSE -il.quantity END)
+                 FROM inventory_ledger il
+                 WHERE il.item_type = 'raw_material' AND il.item_id = rm.id
+                 ${location_id ? 'AND il.location_id = ?' : ''}
+               ), 0) AS current_stock
+        FROM raw_materials rm
+        LEFT JOIN items i ON i.id = rm.id
+        WHERE rm.deleted_at IS NULL
+        UNION
+        SELECT i.id, i.name, i.unit, COALESCE(i.code, '') AS code,
+               COALESCE((
+                 SELECT SUM(CASE WHEN il.transaction_type = 'in' THEN il.quantity ELSE -il.quantity END)
+                 FROM inventory_ledger il
+                 WHERE il.item_type = 'raw_material' AND il.item_id = i.id
+                 ${location_id ? 'AND il.location_id = ?' : ''}
+               ), 0) AS current_stock
+        FROM items i
+        WHERE (LOWER(REPLACE(i.item_type, ' ', '_')) = 'raw_material' OR LOWER(i.item_type) LIKE '%material%' OR LOWER(i.item_type) LIKE '%raw%')
+          AND i.deleted_at IS NULL
+          AND i.id NOT IN (SELECT id FROM raw_materials WHERE deleted_at IS NULL)
+        ORDER BY name ASC
+      `;
+      const params = location_id ? [location_id, location_id] : [];
+      const result = await req.tenantDb.query(q, params);
+      items = (result.rows || []).map(r => ({ ...r, current_stock: Number(r.current_stock || 0) }));
+    } else if (item_type === 'finished_good') {
+      const q = `
+        SELECT fg.id, fg.name, fg.unit, COALESCE(fg.hsn_code, '') AS code,
+               COALESCE((
+                 SELECT SUM(CASE WHEN il.transaction_type = 'in' THEN il.quantity ELSE -il.quantity END)
+                 FROM inventory_ledger il
+                 WHERE il.item_type = 'finished_good' AND il.item_id = fg.id
+                 ${location_id ? 'AND il.location_id = ?' : ''}
+               ), 0) AS current_stock
+        FROM finished_goods fg
+        WHERE fg.deleted_at IS NULL
+        UNION
+        SELECT i.id, i.name, i.unit, COALESCE(i.code, '') AS code,
+               COALESCE((
+                 SELECT SUM(CASE WHEN il.transaction_type = 'in' THEN il.quantity ELSE -il.quantity END)
+                 FROM inventory_ledger il
+                 WHERE il.item_type = 'finished_good' AND il.item_id = i.id
+                 ${location_id ? 'AND il.location_id = ?' : ''}
+               ), 0) AS current_stock
+        FROM items i
+        WHERE (LOWER(REPLACE(i.item_type, ' ', '_')) = 'finished_good' OR LOWER(i.item_type) LIKE '%finish%')
+          AND i.deleted_at IS NULL
+          AND i.id NOT IN (SELECT id FROM finished_goods WHERE deleted_at IS NULL)
+        ORDER BY name ASC
+      `;
+      const params = location_id ? [location_id, location_id] : [];
+      const result = await req.tenantDb.query(q, params);
+      const rawItems = (result.rows || []).map(r => ({ ...r, current_stock: Number(r.current_stock || 0) }));
+
+      // Fetch packaging levels and packaging stock for finished goods
+      const pplRes = await req.tenantDb.query(
+        `SELECT id, product_id, name, package_unit, base_quantity_equivalent, is_default
+         FROM product_packaging_levels
+         WHERE status != 'archived'
+         ORDER BY is_default DESC, base_quantity_equivalent ASC`
+      ).catch(() => ({ rows: [] }));
+
+      const pkgStockQ = `
+        SELECT item_id, packaging_level_id,
+               COALESCE(SUM(
+                 CASE WHEN transaction_type = 'in' THEN COALESCE(package_count, 0)
+                      WHEN transaction_type = 'out' THEN -COALESCE(package_count, 0)
+                      ELSE 0 END
+               ), 0) AS packaged_stock
+        FROM inventory_ledger
+        WHERE item_type = 'finished_good' AND packaging_level_id IS NOT NULL
+        ${location_id ? 'AND location_id = ?' : ''}
+        GROUP BY item_id, packaging_level_id
+      `;
+      const pkgStockRes = await req.tenantDb.query(pkgStockQ, location_id ? [location_id] : []).catch(() => ({ rows: [] }));
+
+      const pkgStockMap = {};
+      for (const ps of pkgStockRes.rows) {
+        pkgStockMap[`${ps.item_id}:${ps.packaging_level_id}`] = Math.max(0, Number(ps.packaged_stock || 0));
+      }
+
+      const levelsByProduct = {};
+      for (const l of pplRes.rows) {
+        if (!levelsByProduct[l.product_id]) levelsByProduct[l.product_id] = [];
+        const pStock = pkgStockMap[`${l.product_id}:${l.id}`] || 0;
+        levelsByProduct[l.product_id].push({
+          id: l.id,
+          name: l.name,
+          package_unit: l.package_unit || 'pkg',
+          base_quantity_equivalent: Number(l.base_quantity_equivalent) || 1,
+          is_default: Boolean(l.is_default),
+          packaged_stock: pStock
+        });
+      }
+
+      items = rawItems.map(fg => {
+        const levels = levelsByProduct[fg.id] || [];
+        if (levels.length > 0) {
+          const inStockLevel = levels.find(l => l.packaged_stock > 0);
+          const activeLevel = inStockLevel || levels.find(l => l.is_default) || levels[0];
+          return {
+            ...fg,
+            base_unit: fg.unit,
+            base_stock: fg.current_stock,
+            unit: activeLevel.package_unit,
+            package_name: activeLevel.name,
+            package_unit: activeLevel.package_unit,
+            packaging_level_id: activeLevel.id,
+            units_per_package: activeLevel.base_quantity_equivalent,
+            current_stock: activeLevel.packaged_stock,
+            packaging_levels: levels
+          };
+        }
+        return fg;
+      });
+    } else if (item_type === 'wip') {
+      const q = `
+        SELECT i.id, i.name, i.code, i.unit,
+               COALESCE((
+                 SELECT SUM(CASE WHEN il.transaction_type = 'in' THEN il.quantity ELSE -il.quantity END)
+                 FROM inventory_ledger il
+                 WHERE il.item_type = 'wip' AND il.item_id = i.id
+                 ${location_id ? 'AND il.location_id = ?' : ''}
+               ), 0) AS current_stock
+        FROM items i
+        WHERE (LOWER(REPLACE(i.item_type, ' ', '_')) = 'wip' OR LOWER(i.item_type) LIKE '%wip%')
+          AND i.deleted_at IS NULL
+        ORDER BY i.name ASC
+      `;
+      const params = location_id ? [location_id] : [];
+      const result = await req.tenantDb.query(q, params);
+      items = (result.rows || []).map(r => ({ ...r, current_stock: Number(r.current_stock || 0) }));
+    }
+
+    return res.json(items);
+  } catch (err) {
+    console.error('get stock-transfers available items error', err);
+    return res.status(500).json({ error: 'Failed to fetch available items: ' + err.message });
+  }
+});
+
 // Create stock transfer
 router.post('/stock-transfers', requireAuth, requirePermission('stock_transfers', 'create'), async (req, res) => {
-  const { from_location_id, to_location_id, item_type, item_id, quantity, notes } = req.body;
+  const { from_location_id, to_location_id, item_type, item_id, quantity, packaging_level_id, notes } = req.body;
   const userId = req.user.user_id || req.user.id;
 
   if (!from_location_id) return res.status(400).json({ error: 'from_location_id is required' });
@@ -367,19 +601,83 @@ router.post('/stock-transfers', requireAuth, requirePermission('stock_transfers'
     if (fromLoc.rowCount === 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Source location not found' }); }
     if (toLoc.rowCount === 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Destination location not found' }); }
 
-    // Check sufficient stock at source location
-    const stockCheck = await client.query(
-      `SELECT SUM(CASE WHEN transaction_type = 'in' THEN quantity
-                       WHEN transaction_type = 'out' THEN -quantity
-                       ELSE quantity END) AS net_stock
-       FROM inventory_ledger
-       WHERE item_type = ? AND item_id = ? AND location_id = ?`,
-      [item_type, item_id, from_location_id]
-    );
-    const sourceStock = Number(stockCheck.rows[0]?.net_stock || 0);
-    if (qty > sourceStock) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: `Insufficient stock at source location: available ${sourceStock}`, available: sourceStock });
+    let unitsPerPkg = 1;
+    let pkgCount = null;
+    let baseQty = qty;
+    let activePkgLevelId = packaging_level_id || null;
+
+    if (item_type === 'finished_good') {
+      let ppl = null;
+      if (activePkgLevelId) {
+        const pplRes = await client.query(
+          'SELECT id, name, package_unit, base_quantity_equivalent FROM product_packaging_levels WHERE id = ?',
+          [activePkgLevelId]
+        );
+        if (pplRes.rowCount > 0) ppl = pplRes.rows[0];
+      } else {
+        const pplRes = await client.query(
+          'SELECT id, name, package_unit, base_quantity_equivalent FROM product_packaging_levels WHERE product_id = ? AND status != "archived" ORDER BY is_default DESC, base_quantity_equivalent ASC LIMIT 1',
+          [item_id]
+        );
+        if (pplRes.rowCount > 0) {
+          ppl = pplRes.rows[0];
+          activePkgLevelId = ppl.id;
+        }
+      }
+
+      if (ppl) {
+        unitsPerPkg = Number(ppl.base_quantity_equivalent) || 1;
+        pkgCount = qty; // User entered number of packages
+        baseQty = qty * unitsPerPkg; // Total base unit equivalent
+
+        // Check sufficient packaged stock at source location
+        const pkgStockCheck = await client.query(
+          `SELECT SUM(CASE WHEN transaction_type = 'in' THEN COALESCE(package_count, 0)
+                           WHEN transaction_type = 'out' THEN -COALESCE(package_count, 0)
+                           ELSE 0 END) AS net_packages
+           FROM inventory_ledger
+           WHERE item_type = 'finished_good' AND item_id = ? AND location_id = ? AND packaging_level_id = ?`,
+          [item_id, from_location_id, activePkgLevelId]
+        );
+        const availPkgs = Number(pkgStockCheck.rows[0]?.net_packages || 0);
+        if (qty > availPkgs) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({
+            error: `Insufficient stock at source location: available ${availPkgs} ${ppl.package_unit || 'packages'}`,
+            available: availPkgs
+          });
+        }
+      } else {
+        // Fallback to base stock check
+        const stockCheck = await client.query(
+          `SELECT SUM(CASE WHEN transaction_type = 'in' THEN quantity
+                           WHEN transaction_type = 'out' THEN -quantity
+                           ELSE quantity END) AS net_stock
+           FROM inventory_ledger
+           WHERE item_type = ? AND item_id = ? AND location_id = ?`,
+          [item_type, item_id, from_location_id]
+        );
+        const sourceStock = Number(stockCheck.rows[0]?.net_stock || 0);
+        if (baseQty > sourceStock) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({ error: `Insufficient stock at source location: available ${sourceStock}`, available: sourceStock });
+        }
+      }
+    } else {
+      // Raw Material / WIP stock check
+      const stockCheck = await client.query(
+        `SELECT SUM(CASE WHEN transaction_type = 'in' THEN quantity
+                         WHEN transaction_type = 'out' THEN -quantity
+                         ELSE quantity END) AS net_stock
+         FROM inventory_ledger
+         WHERE item_type = ? AND item_id = ? AND location_id = ?`,
+        [item_type, item_id, from_location_id]
+      );
+      const sourceStock = Number(stockCheck.rows[0]?.net_stock || 0);
+      if (baseQty > sourceStock) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: `Insufficient stock at source location: available ${sourceStock}`, available: sourceStock });
+      }
     }
 
     // Generate transfer number
@@ -389,23 +687,23 @@ router.post('/stock-transfers', requireAuth, requirePermission('stock_transfers'
     await client.query(
       `INSERT INTO stock_transfers (id, transfer_number, from_location_id, to_location_id, item_type, item_id, quantity, notes, created_by)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [transferId, transferNumber, from_location_id, to_location_id, item_type, item_id, qty, notes || null, userId]
+      [transferId, transferNumber, from_location_id, to_location_id, item_type, item_id, baseQty, notes || null, userId]
     );
 
-    // Write paired OUT/IN ledger entries
+    // Write paired OUT/IN ledger entries with package_count & packaging_level_id
     const outId = crypto.randomUUID();
     const inId = crypto.randomUUID();
     const today = new Date().toISOString().slice(0, 10);
 
     await client.query(
-      `INSERT INTO inventory_ledger (id, item_type, item_id, transaction_type, quantity, location_id, reference_table, reference_id, reason, created_by, date)
-       VALUES (?, ?, ?, 'out', ?, ?, 'stock_transfers', ?, 'Stock transfer out', ?, ?)`,
-      [outId, item_type, item_id, qty, from_location_id, transferId, userId, today]
+      `INSERT INTO inventory_ledger (id, item_type, item_id, transaction_type, quantity, package_count, packaging_level_id, location_id, reference_table, reference_id, reason, created_by, date)
+       VALUES (?, ?, ?, 'out', ?, ?, ?, ?, 'stock_transfers', ?, 'Stock transfer out', ?, ?)`,
+      [outId, item_type, item_id, baseQty, pkgCount, activePkgLevelId, from_location_id, transferId, userId, today]
     );
     await client.query(
-      `INSERT INTO inventory_ledger (id, item_type, item_id, transaction_type, quantity, location_id, reference_table, reference_id, reason, created_by, date)
-       VALUES (?, ?, ?, 'in', ?, ?, 'stock_transfers', ?, 'Stock transfer in', ?, ?)`,
-      [inId, item_type, item_id, qty, to_location_id, transferId, userId, today]
+      `INSERT INTO inventory_ledger (id, item_type, item_id, transaction_type, quantity, package_count, packaging_level_id, location_id, reference_table, reference_id, reason, created_by, date)
+       VALUES (?, ?, ?, 'in', ?, ?, ?, ?, 'stock_transfers', ?, 'Stock transfer in', ?, ?)`,
+      [inId, item_type, item_id, baseQty, pkgCount, activePkgLevelId, to_location_id, transferId, userId, today]
     );
 
     await client.query('COMMIT');

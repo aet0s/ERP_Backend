@@ -14,6 +14,7 @@ const crypto = require('crypto');
 const { publishReturnRequestMessage } = require('../lib/returnRequestSocket');
 const { requireVendorPortalAuth, requirePortalPermission } = require('../middleware/portalAuth');
 const { getNextDocumentNumber } = require('../lib/invoiceEngine');
+const { executeApproveReturnRequest } = require('../lib/returnsEngine');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CHAT HELPER
@@ -331,28 +332,36 @@ router.post('/return-requests', requireVendorPortalAuth, requirePortalPermission
 // Vendor Action: ACCEPT Return Request initiated by Owner/Manager
 router.post('/return-requests/:id/accept', requireVendorPortalAuth, requirePortalPermission('returns', 'edit'), async (req, res) => {
   const { notes } = req.body;
+  const client = await req.tenantDb.connect();
   try {
-    const rrRes = await req.tenantDb.query(
-      'SELECT id, vendor_id, status, reference_id, request_type FROM return_requests WHERE id = ?',
+    await client.query('START TRANSACTION');
+
+    const rrRes = await client.query(
+      'SELECT id, vendor_id, status, reference_id, request_type FROM return_requests WHERE id = ? FOR UPDATE',
       [req.params.id]
     );
-    if (rrRes.rowCount === 0) return res.status(404).json({ error: 'Return request not found' });
-    if (rrRes.rows[0].vendor_id !== req.vendorUser.vendor_id) return res.status(403).json({ error: 'Access denied' });
-
-    if (rrRes.rows[0].status !== 'Pending') return res.status(409).json({ error: 'This return request has already been reviewed' });
-
-    await req.tenantDb.query(
-      `UPDATE return_requests
-       SET status = 'Approved', review_notes = ?, reviewed_by = ?, reviewed_at = NOW(), updated_at = NOW()
-       WHERE id = ?`,
-      [notes ? notes.trim() : 'Approved by vendor', req.vendorUser.portal_user_id, req.params.id]
-    );
-    if (['purchase_return', 'purchase_cancellation'].includes(rrRes.rows[0].request_type)) {
-      await req.tenantDb.query(
-        "UPDATE procurements SET status = 'Return Accepted by Vendor', updated_at = NOW() WHERE id = ? AND vendor_id = ?",
-        [rrRes.rows[0].reference_id, req.vendorUser.vendor_id]
-      );
+    if (rrRes.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Return request not found' });
     }
+    if (rrRes.rows[0].vendor_id !== req.vendorUser.vendor_id) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    if (rrRes.rows[0].status !== 'Pending') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'This return request has already been reviewed' });
+    }
+
+    await executeApproveReturnRequest(
+      client,
+      req.params.id,
+      req.vendorUser.portal_user_id,
+      notes ? notes.trim() : 'Approved by vendor'
+    );
+
+    await client.query('COMMIT');
 
     // Auto-close chat with a system message
     await insertSystemMessage(
@@ -361,9 +370,13 @@ router.post('/return-requests/:id/accept', requireVendorPortalAuth, requirePorta
       `✅ Vendor has Approved this return request. ${notes ? `Notes: ${notes.trim()}` : ''} The chat is now closed and contact information is available.`
     );
 
-    return res.json({ ok: true, message: 'Return request approved by vendor' });
+    return res.json({ ok: true, message: 'Return request approved by vendor and inventory updated' });
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('vendorPortal accept return error:', err);
     return res.status(500).json({ error: 'Failed to accept return request' });
+  } finally {
+    client.release();
   }
 });
 

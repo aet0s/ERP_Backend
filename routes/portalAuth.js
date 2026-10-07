@@ -1234,7 +1234,7 @@ router.get(['/orders', '/portal/orders'], requireUniversalPortalAuth, async (req
       const cPlaceholders = matchedCustomerIds.map(() => '?').join(',');
 
       const params = [...matchedCustomerIds];
-      let where = `s.customer_id IN (${cPlaceholders}) AND s.deleted_at IS NULL`;
+      let where = `s.customer_id IN (${cPlaceholders}) AND (s.status IS NULL OR s.status != 'Deleted by Customer')`;
 
       if (status && status !== 'all') {
         where += ' AND s.status = ?';
@@ -1287,7 +1287,7 @@ router.get(['/orders', '/portal/orders'], requireUniversalPortalAuth, async (req
           s.amount_received AS amount_paid,
           s.amount_due,
           s.payment_status,
-          COALESCE(s.status, 'Sales Order Sent') AS status,
+          CASE WHEN s.deleted_at IS NOT NULL AND (s.status IS NULL OR s.status NOT IN ('Cancelled', 'Returned', 'Rejected by Vendor')) THEN 'Cancelled' ELSE COALESCE(s.status, 'Sales Order Sent') END AS status,
           s.customer_notes,
           s.decline_reason,
           s.dispatch_tracking_ref,
@@ -2103,6 +2103,23 @@ router.post(['/orders/:id/action', '/portal/orders/:id/action'], requireUniversa
       } else if (action === 'decline_order') {
         await tenantDb.query('UPDATE sales SET status = \'Declined by Customer\', decline_reason = ? WHERE id = ?', [reason || 'Declined by customer', id]);
         return res.json({ ok: true, message: 'Sales order declined.', new_status: 'Declined by Customer' });
+      } else if (action === 'cancel_order' || action === 'delete_order') {
+        const cleanReason = (reason || req.body?.notes || 'Cancelled by customer').trim();
+        const newStatus = action === 'delete_order' ? 'Deleted by Customer' : 'Cancelled by Customer';
+        await tenantDb.query(
+          'UPDATE sales SET status = ?, decline_reason = ?, updated_at = NOW() WHERE id = ?',
+          [newStatus, cleanReason, id]
+        );
+
+        const custInfo = cMatch.rows[0]?.name || globalUser.name || 'Customer';
+        await createNotification(tenantDb, {
+          user_type: 'user',
+          title: 'Order Cancelled by Customer',
+          message: `${custInfo} has cancelled Order ${sRes.rows[0].invoice_number || id}. Reason: ${cleanReason}`,
+          link: '/sales'
+        }).catch(() => {});
+
+        return res.json({ ok: true, message: 'Order cancelled successfully.', new_status: newStatus });
       } else if (action === 'receive_goods' || action === 'confirm_delivery') {
         const newStatus = 'Goods Received';
         await tenantDb.query(

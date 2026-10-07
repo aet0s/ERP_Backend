@@ -757,17 +757,17 @@ router.get('/global-search', requireAuth, async (req, res) => {
 
     // 6. Procurement & Purchase Orders
     const procRes = await tenantDb.query(
-      `SELECT p.id, p.invoice_number, p.po_number, p.date, p.total_amount, p.status, v.name AS vendor_name
+      `SELECT p.id, p.procurement_number, p.date, p.total_amount, p.status, v.name AS vendor_name
        FROM procurements p
        LEFT JOIN vendors v ON v.id = p.vendor_id
-       WHERE p.deleted_at IS NULL AND (p.invoice_number LIKE ? OR p.po_number LIKE ? OR v.name LIKE ? OR p.id LIKE ?)
+       WHERE p.deleted_at IS NULL AND (p.procurement_number LIKE ? OR v.name LIKE ? OR p.id LIKE ?)
        ORDER BY p.date DESC
        LIMIT 5`,
-      [q, q, q, q]
+      [q, q, q]
     ).catch(() => ({ rows: [] }));
 
     for (const p of procRes.rows) {
-      const docNo = p.po_number || p.invoice_number || `PO #${p.id.slice(0, 8)}`;
+      const docNo = p.procurement_number || `PROC #${p.id.slice(0, 8)}`;
       const dateStr = p.date ? new Date(p.date).toISOString().slice(0, 10) : '';
       const parts = [];
       if (p.vendor_name) parts.push(p.vendor_name);
@@ -780,7 +780,7 @@ router.get('/global-search', requireAuth, async (req, res) => {
         badge: 'PO / Bill',
         title: docNo,
         subtitle: parts.join(' • '),
-        link: `/procurement?search=${encodeURIComponent(p.po_number || p.invoice_number || p.vendor_name || p.id)}`
+        link: `/procurement?search=${encodeURIComponent(p.procurement_number || p.vendor_name || p.id)}`
       });
     }
 
@@ -2427,6 +2427,60 @@ router.get('/payments', requireAuth, async (req, res) => {
   return sendList(req, res, rows.rows, count.rows[0].count, {
     total_amount: rows.rows.reduce((sum, row) => sum + numeric(row.amount), 0)
   });
+});
+
+router.get('/payments/:id', requireAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const query = `
+      SELECT pl.id, pl.related_type, pl.related_type AS type, pl.related_id, pl.amount, pl.date, pl.notes, pl.created_at,
+             COALESCE(v.name, c.name, 'Walk-in') AS party_name,
+             v.name AS vendor_name,
+             c.name AS customer_name,
+             COALESCE(p.procurement_number, s.invoice_number, pl.related_id) AS related_reference,
+             p.procurement_number AS procurement_number,
+             s.invoice_number AS invoice_number,
+             COALESCE(p.total_amount, s.total_amount, pl.amount) AS total_amount,
+             COALESCE(p.amount_paid, s.amount_received, pl.amount) AS amount_paid,
+             COALESCE(p.amount_due, s.amount_due, 0) AS amount_due,
+             COALESCE(p.status, s.status, 'Completed') AS status,
+             u.name AS created_by_name
+      FROM payments_log pl
+      LEFT JOIN procurements p ON pl.related_type = 'procurement' AND p.id = pl.related_id AND p.deleted_at IS NULL
+      LEFT JOIN vendors v ON v.id = p.vendor_id
+      LEFT JOIN sales s ON pl.related_type = 'sale' AND s.id = pl.related_id AND s.deleted_at IS NULL
+      LEFT JOIN customers c ON c.id = s.customer_id
+      LEFT JOIN users u ON u.id = pl.created_by
+      WHERE pl.id = ? AND pl.deleted_at IS NULL
+    `;
+    const result = await req.tenantDb.query(query, [id]);
+    if (!result.rows || result.rows.length === 0) {
+      return res.status(404).json({ error: 'Payment record not found' });
+    }
+    const payment = result.rows[0];
+    payment.payment_number = `PAY-${payment.id.slice(0, 8).toUpperCase()}`;
+
+    let timeline = [];
+    if (payment.related_id && payment.related_type) {
+      timeline = await detailTimeline(req.tenantDb, payment.related_type === 'procurement' ? 'procurements' : 'sales', payment.related_id);
+    }
+    if (!timeline.length) {
+      timeline = [
+        {
+          kind: 'Payment Recorded',
+          date: payment.date || payment.created_at,
+          notes: payment.notes || `Payment of ₹${payment.amount} recorded for ${payment.related_type}`,
+          amount: payment.amount
+        }
+      ];
+    }
+    payment.timeline = timeline;
+
+    return res.json(payment);
+  } catch (err) {
+    console.error('get payment detail error', err);
+    return res.status(500).json({ error: 'Failed to fetch payment details: ' + err.message });
+  }
 });
 
 // Inventory Stock & Alerts

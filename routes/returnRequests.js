@@ -18,6 +18,7 @@ const { requireAuth, requireRole, requirePermission } = require('../middleware/a
 const { getNextDocumentNumber } = require('../lib/invoiceEngine');
 const { createNotification } = require('../lib/notifications');
 const { publishReturnRequestMessage } = require('../lib/returnRequestSocket');
+const { executeApproveReturnRequest } = require('../lib/returnsEngine');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CHAT HELPER — auto-insert system event messages
@@ -286,8 +287,8 @@ router.get('/return-requests/:id', requireAuth, async (req, res) => {
           name: item.item_name || 'Item',
           quantity: item.quantity,
           unit: item.unit || 'units',
-          rate_per_unit: item.unit_price || item.rate,
-          total_price: item.total_price || (item.quantity * item.unit_price)
+          rate_per_unit: item.unit_price || item.rate || item.rate_per_unit,
+          total_price: item.total_price || (item.quantity * (item.unit_price || item.rate || item.rate_per_unit || 0))
         }));
       } else if (row.reference_type === 'sale') {
         const saleItems = await req.tenantDb.query(
@@ -298,6 +299,7 @@ router.get('/return-requests/:id', requireAuth, async (req, res) => {
            FROM sales_items si
            LEFT JOIN finished_goods fg ON fg.id = si.finished_good_id
            LEFT JOIN product_packaging_levels ppl ON ppl.id = COALESCE(si.packaging_level_id, si.packaging_config_id)
+           LEFT JOIN packaging_configurations pc ON pc.id = si.packaging_config_id
            WHERE si.sale_id = ?`,
           [row.reference_id]
         );
@@ -311,6 +313,45 @@ router.get('/return-requests/:id', requireAuth, async (req, res) => {
           rate_per_unit: item.rate_per_unit,
           total_price: item.line_total || (item.quantity * item.rate_per_unit)
         }));
+      }
+    } else if (parsedItems && parsedItems.length > 0 && row.reference_id) {
+      // Enrich existing parsed items that were submitted without rate_per_unit or total_price
+      if (row.reference_type === 'sale') {
+        const saleItems = await req.tenantDb.query(
+          `SELECT si.finished_good_id, si.rate_per_unit, si.line_total, fg.name AS item_name, fg.unit AS base_unit
+           FROM sales_items si
+           LEFT JOIN finished_goods fg ON fg.id = si.finished_good_id
+           WHERE si.sale_id = ?`,
+          [row.reference_id]
+        );
+        for (const it of parsedItems) {
+          if (!it.rate_per_unit || Number(it.rate_per_unit) === 0) {
+            const match = saleItems.rows.find(si => si.finished_good_id === (it.finished_good_id || it.item_id) || si.item_name === it.name || si.item_name === it.item_name);
+            if (match) {
+              it.rate_per_unit = match.rate_per_unit;
+              it.unit = it.unit || match.base_unit || 'units';
+              it.total_price = Number(it.quantity || 1) * Number(match.rate_per_unit || 0);
+            }
+          }
+        }
+      } else if (row.reference_type === 'procurement') {
+        const procItems = await req.tenantDb.query(
+          `SELECT pi.item_id, pi.rate_per_unit, rm.name AS item_name, rm.unit
+           FROM procurement_items pi
+           LEFT JOIN raw_materials rm ON rm.id = pi.item_id
+           WHERE pi.procurement_id = ?`,
+          [row.reference_id]
+        );
+        for (const it of parsedItems) {
+          if (!it.rate_per_unit || Number(it.rate_per_unit) === 0) {
+            const match = procItems.rows.find(pi => pi.item_id === it.item_id || pi.item_name === it.name || pi.item_name === it.item_name);
+            if (match) {
+              it.rate_per_unit = match.rate_per_unit;
+              it.unit = it.unit || match.unit || 'units';
+              it.total_price = Number(it.quantity || 1) * Number(match.rate_per_unit || 0);
+            }
+          }
+        }
       }
     }
 
@@ -424,149 +465,9 @@ router.post('/return-requests/:id/approve', requireAuth, requirePermission('retu
     }
     const rr = rrRes.rows[0];
 
-    // Purchase returns raised by ERP staff are decisions for the vendor. They
-    // must be acted on in the vendor portal, never approved internally.
-    if (['purchase_return', 'purchase_cancellation'].includes(rr.request_type) && rr.requested_by_type === 'internal') {
-      await client.query('ROLLBACK');
-      return res.status(403).json({ error: 'Vendor response is required for this purchase return request' });
-    }
-
-    let outcomeDocType = null;
-    let outcomeDocId = null;
-
-    // ── Dispatch based on request_type ──────────────────────────────────────
-    if (rr.request_type === 'purchase_cancellation') {
-      // Soft-delete the procurement and reverse its ledger entries
-      const procRes = await client.query(
-        'SELECT * FROM procurements WHERE id = ? AND deleted_at IS NULL FOR UPDATE',
-        [rr.reference_id]
-      );
-      if (procRes.rowCount > 0) {
-        const proc = procRes.rows[0];
-        // Reverse each procurement_item ledger entry
-        const piRes = await client.query(
-          'SELECT * FROM procurement_items WHERE procurement_id = ?',
-          [proc.id]
-        );
-        for (const pi of piRes.rows) {
-          const revId = crypto.randomUUID();
-          await client.query(
-            `INSERT INTO inventory_ledger (id, item_type, item_id, transaction_type, quantity, reference_table, reference_id, reason, created_by, date)
-             VALUES (?, 'raw_material', ?, 'out', ?, 'return_requests', ?, 'Purchase cancellation approved', ?, ?)`,
-            [revId, pi.item_id, pi.quantity, rr.id, userId, new Date().toISOString().slice(0, 10)]
-          );
-        }
-        // Soft delete procurement and its payment logs
-        await client.query(
-          'UPDATE procurements SET deleted_at = NOW(), deleted_by = ? WHERE id = ?',
-          [userId, proc.id]
-        );
-        await client.query(
-          "UPDATE payments_log SET deleted_at = NOW(), deleted_by = ? WHERE related_type = 'procurement' AND related_id = ?",
-          [userId, proc.id]
-        );
-      }
-
-    } else if (rr.request_type === 'purchase_return') {
-      // Create a Debit Note from the items snapshot
-      try {
-        const debitNoteNumber = await getNextDocumentNumber(client, 'debit_note');
-        outcomeDocId = crypto.randomUUID();
-        outcomeDocType = 'debit_note';
-
-        const parsedItems = rr.items ? (typeof rr.items === 'string' ? JSON.parse(rr.items) : rr.items) : [];
-        const totalAmount = parsedItems.reduce((s, i) => s + (Number(i.quantity || 0) * Number(i.rate_per_unit || 0)), 0);
-
-        await client.query(
-          `INSERT INTO debit_notes (id, debit_note_number, vendor_id, procurement_id, reason, total_amount, status, created_by)
-           VALUES (?, ?, ?, ?, ?, ?, 'Issued', ?)`,
-          [outcomeDocId, debitNoteNumber, rr.vendor_id, rr.reference_id, rr.reason, totalAmount, userId]
-        );
-
-        // Reverse inventory for returned items
-        for (const item of parsedItems) {
-          if (!item.item_id || !item.quantity) continue;
-          const revId = crypto.randomUUID();
-          await client.query(
-            `INSERT INTO inventory_ledger (id, item_type, item_id, transaction_type, quantity, reference_table, reference_id, reason, created_by, date)
-             VALUES (?, 'raw_material', ?, 'out', ?, 'return_requests', ?, 'Purchase return approved', ?, ?)`,
-            [revId, item.item_id, item.quantity, rr.id, userId, new Date().toISOString().slice(0, 10)]
-          );
-        }
-      } catch (e) {
-        // debit_notes table may not exist in all schema versions — log and continue
-        console.warn('Could not create debit note:', e.message);
-      }
-
-    } else if (rr.request_type === 'sales_cancellation') {
-      // Soft-delete the sale and reverse its ledger entries
-      const saleRes = await client.query(
-        'SELECT * FROM sales WHERE id = ? AND deleted_at IS NULL FOR UPDATE',
-        [rr.reference_id]
-      );
-      if (saleRes.rowCount > 0) {
-        const sale = saleRes.rows[0];
-        const revId = crypto.randomUUID();
-        await client.query(
-          `INSERT INTO inventory_ledger (id, item_type, item_id, transaction_type, quantity, reference_table, reference_id, reason, created_by, date)
-           VALUES (?, 'finished_good', ?, 'in', ?, 'return_requests', ?, 'Sales cancellation approved', ?, ?)`,
-          [revId, sale.finished_good_id, sale.quantity, rr.id, userId, new Date().toISOString().slice(0, 10)]
-        );
-        await client.query(
-          'UPDATE sales SET deleted_at = NOW(), deleted_by = ? WHERE id = ?',
-          [userId, sale.id]
-        );
-        await client.query(
-          "UPDATE payments_log SET deleted_at = NOW(), deleted_by = ? WHERE related_type = 'sale' AND related_id = ?",
-          [userId, sale.id]
-        );
-      }
-
-    } else if (rr.request_type === 'sales_return') {
-      // Create a Credit Note
-      try {
-        const creditNoteNumber = await getNextDocumentNumber(client, 'credit_note');
-        outcomeDocId = crypto.randomUUID();
-        outcomeDocType = 'credit_note';
-
-        const parsedItems = rr.items ? (typeof rr.items === 'string' ? JSON.parse(rr.items) : rr.items) : [];
-        const totalAmount = parsedItems.reduce((s, i) => s + (Number(i.quantity || 0) * Number(i.rate_per_unit || 0)), 0);
-
-        await client.query(
-          `INSERT INTO credit_notes (id, credit_note_number, customer_id, sale_id, reason, total_amount, notes, date, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
-          [outcomeDocId, creditNoteNumber, rr.customer_id, rr.reference_id, rr.reason, totalAmount, review_notes || 'Issued from approved return request']
-        );
-
-        // Reverse inventory for returned goods in base units
-        for (const item of parsedItems) {
-          const targetItemId = item.finished_good_id || item.item_id;
-          if (!targetItemId || !item.quantity) continue;
-          const unitsPerPkg = Number(item.units_per_package) || 1;
-          const baseReturnQty = Number(item.quantity) * unitsPerPkg;
-          const revId = crypto.randomUUID();
-          await client.query(
-            `INSERT INTO inventory_ledger (id, item_type, item_id, transaction_type, quantity, reference_table, reference_id, reason, created_by, date)
-             VALUES (?, 'finished_good', ?, 'in', ?, 'return_requests', ?, 'Sales return approved (base units)', ?, ?)`,
-            [revId, targetItemId, baseReturnQty, rr.id, userId, new Date().toISOString().slice(0, 10)]
-          );
-        }
-        if (rr.reference_id) {
-          await client.query("UPDATE sales SET status = 'Returned', updated_at = NOW() WHERE id = ?", [rr.reference_id]).catch(() => {});
-        }
-      } catch (e) {
-        console.warn('Could not create credit note:', e.message);
-      }
-    }
-
-    // Update the return request record
-    await client.query(
-      `UPDATE return_requests
-       SET status = 'Approved', reviewed_by = ?, reviewed_at = NOW(), review_notes = ?,
-           outcome_document_type = ?, outcome_document_id = ?, updated_at = NOW()
-       WHERE id = ?`,
-      [userId, review_notes || null, outcomeDocType, outcomeDocId, req.params.id]
-    );
+    const approvalResult = await executeApproveReturnRequest(client, req.params.id, userId, review_notes);
+    outcomeDocType = approvalResult.outcome_document_type;
+    outcomeDocId = approvalResult.outcome_document_id;
 
     if (rr.customer_id) {
       await createNotification(client, {

@@ -6,6 +6,7 @@ const { calculateInvoiceLine, calculateInvoiceTotals, getNextDocumentNumber } = 
 const { streamInvoicePdf } = require('../lib/pdfInvoice');
 const { queryMaster } = require('../db/masterDb');
 const { createNotification } = require('../lib/notifications');
+const { getSaleFinancials } = require('../lib/returnsEngine');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CUSTOMER ORDER PROCESS CHAIN & SALES INVOICES
@@ -94,6 +95,7 @@ router.get('/', requireAuth, requirePermission('sales', 'view'), async (req, res
              (SELECT COALESCE(SUM(si.quantity), 0)
               FROM sales_items si
               WHERE si.sale_id = s.id) AS total_quantity,
+             (SELECT COALESCE(SUM(cn.total_amount), 0) FROM credit_notes cn WHERE cn.sale_id = s.id) AS credit_note_total,
              (SELECT rr.id FROM return_requests rr WHERE rr.reference_id = s.id ORDER BY rr.created_at DESC LIMIT 1) AS return_request_id,
              (SELECT rr.status FROM return_requests rr WHERE rr.reference_id = s.id ORDER BY rr.created_at DESC LIMIT 1) AS return_status
       FROM sales s
@@ -121,10 +123,18 @@ router.get('/', requireAuth, requirePermission('sales', 'view'), async (req, res
       if (!r.total_quantity || Number(r.total_quantity) === 0) {
         r.total_quantity = Number(r.quantity || 0);
       }
-      if (r.subtotal !== undefined && r.subtotal !== null && (Number(r.tax_amount) > 0 || Number(r.discount_amount) > 0 || Number(r.subtotal) > 0)) {
-        r.total_amount = Number(r.subtotal || 0) + Number(r.tax_amount || 0) - Number(r.discount_amount || 0);
-      }
-      r.amount_due = Math.max(0, Number(r.total_amount || 0) - Number(r.amount_received || 0));
+      const effectiveTax = Number(r.total_tax != null ? r.total_tax : (r.tax_amount || 0));
+      r.total_tax = effectiveTax;
+      r.tax_amount = effectiveTax;
+
+      const fin = getSaleFinancials(r, r.credit_note_total);
+      r.total_amount = fin.original_total;
+      r.returned_amount = fin.returned_amount;
+      r.net_total = fin.net_total;
+      r.amount_received = fin.amount_received;
+      r.amount_due = fin.amount_due;
+      r.amount_to_return = fin.amount_to_return;
+      r.payment_status = fin.payment_status;
     }
 
     if (isTable) {
@@ -267,6 +277,41 @@ router.post('/credit-notes', requireAuth, requirePermission('sales', 'create'), 
       [id, creditNoteNumber, customer_id, sale_id || null, reason.trim(), Number(total_amount), notes || null, noteDate, userId]
     );
 
+    // If linked to sale_id, update sale status and optionally restock inventory
+    if (sale_id) {
+      const saleRes = await req.tenantDb.query('SELECT * FROM sales WHERE id = ?', [sale_id]);
+      if (saleRes.rowCount > 0) {
+        const sale = saleRes.rows[0];
+        const rawItems = req.body.items || [];
+        const items = Array.isArray(rawItems) ? rawItems : [];
+
+        let locationId = sale.location_id;
+        if (!locationId) {
+          const defLoc = await req.tenantDb.query('SELECT id FROM locations WHERE is_default = 1 LIMIT 1');
+          locationId = defLoc.rows[0]?.id || null;
+        }
+
+        if (items.length > 0) {
+          for (const it of items) {
+            const fgId = it.finished_good_id || it.item_id;
+            const qty = Number(it.quantity || 0);
+            if (!fgId || qty <= 0) continue;
+            const unitsPerPkg = Number(it.units_per_package || 1);
+            const baseQty = qty * unitsPerPkg;
+            await req.tenantDb.query(
+              `INSERT INTO inventory_ledger
+                 (id, item_type, item_id, location_id, packaging_level_id, package_count, transaction_type, quantity, reference_table, reference_id, reason, created_by, date)
+               VALUES (?, 'finished_good', ?, ?, ?, ?, 'in', ?, 'credit_notes', ?, 'Credit Note goods return', ?, ?)`,
+              [crypto.randomUUID(), fgId, locationId, it.packaging_level_id || null, unitsPerPkg > 1 ? qty : null, baseQty, id, userId, noteDate]
+            );
+          }
+        }
+
+        const isFullReturn = Number(total_amount) >= Number(sale.total_amount) - 0.01;
+        await req.tenantDb.query('UPDATE sales SET status = ?, updated_at = NOW() WHERE id = ?', [isFullReturn ? 'Returned' : 'Partially Returned', sale_id]);
+      }
+    }
+
     const fetched = await req.tenantDb.query(
       `SELECT cn.*, c.name AS customer_name, s.invoice_number AS sale_invoice_number
        FROM credit_notes cn
@@ -340,6 +385,17 @@ router.get('/:id', requireAuth, requirePermission('sales', 'view'), async (req, 
     }
 
     sale.payments_history = paymentsRes.rows || [];
+
+    const cnRes = await req.tenantDb.query('SELECT COALESCE(SUM(total_amount), 0) AS credit_note_total FROM credit_notes WHERE sale_id = ?', [req.params.id]);
+    const creditNoteTotal = Number(cnRes.rows[0]?.credit_note_total || 0);
+    const fin = getSaleFinancials(sale, creditNoteTotal);
+    sale.total_amount = fin.original_total;
+    sale.returned_amount = fin.returned_amount;
+    sale.net_total = fin.net_total;
+    sale.amount_received = fin.amount_received;
+    sale.amount_due = fin.amount_due;
+    sale.amount_to_return = fin.amount_to_return;
+    sale.payment_status = fin.payment_status;
 
     return res.json(sale);
   } catch (err) {
@@ -952,6 +1008,17 @@ router.get('/:id/payments', requireAuth, async (req, res) => {
       )).rows;
     }
 
+    const cnRes = await req.tenantDb.query('SELECT COALESCE(SUM(total_amount), 0) AS credit_note_total FROM credit_notes WHERE sale_id = ?', [req.params.id]);
+    const creditNoteTotal = Number(cnRes.rows[0]?.credit_note_total || 0);
+    const fin = getSaleFinancials(sale, creditNoteTotal);
+    sale.total_amount = fin.original_total;
+    sale.returned_amount = fin.returned_amount;
+    sale.net_total = fin.net_total;
+    sale.amount_received = fin.amount_received;
+    sale.amount_due = fin.amount_due;
+    sale.amount_to_return = fin.amount_to_return;
+    sale.payment_status = fin.payment_status;
+
     return res.json({ sale, payments });
   } catch (err) {
     console.error('get invoice payments error', err);
@@ -973,10 +1040,23 @@ router.post('/:id/payments', requireAuth, async (req, res) => {
       return res.status(404).json({ error: 'Invoice not found' });
     }
     const sale = saleRes.rows[0];
-    const currentReceived = Number(sale.amount_received || 0);
-    const totalAmt = Number(sale.total_amount || 0);
-    const newReceived = currentReceived + amt;
-    const newDue = Math.max(0, totalAmt - newReceived);
+    const cnRes = await req.tenantDb.query('SELECT COALESCE(SUM(total_amount), 0) AS credit_note_total FROM credit_notes WHERE sale_id = ?', [req.params.id]);
+    const creditNoteTotal = Number(cnRes.rows[0]?.credit_note_total || 0);
+    const fin = getSaleFinancials(sale, creditNoteTotal);
+    const currentDue = fin.amount_due;
+
+    if (currentDue <= 0.009) {
+      await req.tenantDb.query('ROLLBACK');
+      return res.status(400).json({ error: 'This invoice has no remaining balance due for retained items.' });
+    }
+
+    if (amt > currentDue + 0.01) {
+      await req.tenantDb.query('ROLLBACK');
+      return res.status(400).json({ error: `Payment amount cannot exceed the remaining due balance of ₹${currentDue.toFixed(2)}` });
+    }
+
+    const newReceived = Number((fin.amount_received + amt).toFixed(2));
+    const newDue = Math.max(0, Number((fin.net_total - newReceived).toFixed(2)));
     const newPaymentStatus = newDue <= 0.01 ? 'Paid' : 'Partially Paid';
 
     await req.tenantDb.query(

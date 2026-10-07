@@ -57,7 +57,7 @@ router.get('/profile', requireCustomerPortalAuth, async (req, res) => {
 router.get('/invoices', requireCustomerPortalAuth, requirePortalPermission('customer_orders', 'view'), async (req, res) => {
   try {
     const params = [req.customerUser.customer_id];
-    let conditions = 's.customer_id = ? AND s.deleted_at IS NULL';
+    let conditions = "s.customer_id = ? AND (s.status IS NULL OR s.status != 'Deleted by Customer')";
 
     if (req.query.status && req.query.status !== 'all') {
       params.push(req.query.status);
@@ -66,7 +66,8 @@ router.get('/invoices', requireCustomerPortalAuth, requirePortalPermission('cust
 
     const result = await req.tenantDb.query(
       `SELECT s.id, s.invoice_number, s.date, s.due_date, s.total_amount, s.amount_received,
-              s.amount_due, s.payment_status, COALESCE(s.status, 'Sales Order Sent') AS status,
+              s.amount_due, s.payment_status,
+              CASE WHEN s.deleted_at IS NOT NULL AND (s.status IS NULL OR s.status NOT IN ('Cancelled', 'Returned', 'Rejected by Vendor')) THEN 'Cancelled' ELSE COALESCE(s.status, 'Sales Order Sent') END AS status,
               s.customer_notes, s.decline_reason, s.dispatch_tracking_ref, s.subtotal,
               s.total_tax, s.notes, s.created_at, c.name AS customer_name
        FROM sales s

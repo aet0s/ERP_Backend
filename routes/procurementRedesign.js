@@ -5,6 +5,7 @@ const { requireAuth, requireRole, requirePermission } = require('../middleware/a
 const { getNextDocumentNumber } = require('../lib/invoiceEngine');
 const { getWeightedAvgCost } = require('../lib/analytics');
 const { createNotification } = require('../lib/notifications');
+const { executeApproveReturnRequest, getProcurementFinancials } = require('../lib/returnsEngine');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // VENDOR ORDER PROCESS CHAIN & PROCUREMENTS
@@ -171,6 +172,7 @@ router.get('/procurements', requireAuth, requirePermission('procurement', 'view'
               LEFT JOIN raw_materials rm ON rm.id = pi.item_id 
               WHERE pi.procurement_id = p.id) AS item_names,
              (SELECT COALESCE(SUM(pi.quantity), 0) FROM procurement_items pi WHERE pi.procurement_id = p.id) AS total_item_quantity,
+             (SELECT COALESCE(SUM(dn.total_amount), 0) FROM debit_notes dn WHERE dn.procurement_id = p.id) AS debit_note_total,
              (SELECT rr.id FROM return_requests rr WHERE rr.reference_id = p.id ORDER BY rr.created_at DESC LIMIT 1) AS return_request_id,
              (SELECT rr.status FROM return_requests rr WHERE rr.reference_id = p.id ORDER BY rr.created_at DESC LIMIT 1) AS return_status,
              (SELECT rr.reason FROM return_requests rr WHERE rr.reference_id = p.id ORDER BY rr.created_at DESC LIMIT 1) AS return_reason
@@ -199,12 +201,14 @@ router.get('/procurements', requireAuth, requirePermission('procurement', 'view'
       if (!r.total_item_quantity || Number(r.total_item_quantity) === 0) {
         r.total_item_quantity = Number(r.quantity || 0);
       }
-      if (r.subtotal !== undefined && r.subtotal !== null && (Number(r.tax_amount) > 0 || Number(r.discount_amount) > 0 || Number(r.subtotal) > 0)) {
-        r.total_amount = Number(r.subtotal || 0) + Number(r.tax_amount || 0) - Number(r.discount_amount || 0);
-      } else if (!r.total_amount || Number(r.total_amount) === 0) {
-        r.total_amount = Number(r.quantity || 0) * Number(r.rate_per_unit || 0);
-      }
-      r.amount_due = Math.max(0, Number(r.total_amount) - Number(r.amount_paid || 0));
+      const fin = getProcurementFinancials(r, r.debit_note_total);
+      r.total_amount = fin.original_total;
+      r.returned_amount = fin.returned_amount;
+      r.net_total = fin.net_total;
+      r.amount_paid = fin.amount_paid;
+      r.amount_due = fin.amount_due;
+      r.amount_to_return = fin.amount_to_return;
+      r.payment_status = fin.payment_status;
     }
 
     if (isTable) {
@@ -257,19 +261,20 @@ router.get('/procurements/:id', requireAuth, async (req, res) => {
     if (result.rowCount === 0) return res.status(404).json({ error: 'Procurement not found' });
     const proc = result.rows[0];
 
-    // Accurate calculation of total_amount and amount_due
-    const subtotal = Number(proc.subtotal) || 0;
-    const taxAmount = Number(proc.tax_amount) || 0;
-    const discount = Number(proc.discount_amount) || 0;
-    if (subtotal > 0 || taxAmount > 0 || discount > 0) {
-      proc.total_amount = subtotal + taxAmount - discount;
-    } else if (!proc.total_amount || Number(proc.total_amount) === 0) {
-      proc.total_amount = Number(proc.quantity || 0) * Number(proc.rate_per_unit || 0);
-    } else {
-      proc.total_amount = Number(proc.total_amount);
-    }
-    proc.amount_paid = Number(proc.amount_paid) || 0;
-    proc.amount_due = Math.max(0, proc.total_amount - proc.amount_paid);
+    // Accurate calculation of total_amount, returned_amount, net_total, amount_due, amount_to_return
+    const dnRes = await req.tenantDb.query(
+      'SELECT COALESCE(SUM(total_amount), 0) AS debit_note_total FROM debit_notes WHERE procurement_id = ?',
+      [req.params.id]
+    );
+    const debitNoteTotal = Number(dnRes.rows[0]?.debit_note_total || 0);
+    const fin = getProcurementFinancials(proc, debitNoteTotal);
+    proc.total_amount = fin.original_total;
+    proc.returned_amount = fin.returned_amount;
+    proc.net_total = fin.net_total;
+    proc.amount_paid = fin.amount_paid;
+    proc.amount_due = fin.amount_due;
+    proc.amount_to_return = fin.amount_to_return;
+    proc.payment_status = fin.payment_status;
 
     // Items with SKU, HSN, Tax
     const itemsRes = await req.tenantDb.query(
@@ -410,21 +415,37 @@ router.post('/procurements', requireAuth, requirePermission('procurement', 'crea
 
   try {
     const procNumber = await getNextDocumentNumber(req.tenantDb, 'procurement');
-    let subtotal = 0;
-    let totalTax = 0;
+    const discPct = Math.min(100, Math.max(0, Number(discount_percent) || 0));
+    const rawDiscAmount = Math.max(0, Number(discount_amount) || 0);
 
+    let grossSubtotal = 0;
+    for (const item of items) {
+      const qty = Math.max(0, Number(item.quantity) || 0);
+      const rate = Math.max(0, Number(item.rate_per_unit || item.rate) || 0);
+      grossSubtotal += qty * rate;
+    }
+
+    const effectiveDiscPct = discPct > 0 ? discPct : (grossSubtotal > 0 && rawDiscAmount > 0 ? (rawDiscAmount / grossSubtotal) * 100 : 0);
+    const finalDiscountAmount = rawDiscAmount > 0 && discPct === 0 ? rawDiscAmount : (grossSubtotal * effectiveDiscPct) / 100;
+    const discountFactor = grossSubtotal > 0 ? Math.max(0, (grossSubtotal - finalDiscountAmount) / grossSubtotal) : 1;
+
+    let taxableSubtotal = 0;
+    let totalTax = 0;
     const processedLines = [];
+
     for (const item of items) {
       const itemId = item.item_id || item.raw_material_id;
       const qty = Math.max(0, Number(item.quantity) || 0);
       const rate = Math.max(0, Number(item.rate_per_unit || item.rate) || 0);
       const taxRate = Math.max(0, Number(item.tax_rate) || 0);
 
-      const lineTaxable = qty * rate;
+      // Discount is given on MRP (qty * rate) first, and then GST or Tax is calculated on that discounted MRP:
+      const lineGross = qty * rate;
+      const lineTaxable = lineGross * discountFactor;
       const lineTax = lineTaxable * (taxRate / 100);
       const lineTotal = lineTaxable + lineTax;
 
-      subtotal += lineTaxable;
+      taxableSubtotal += lineTaxable;
       totalTax += lineTax;
 
       processedLines.push({
@@ -437,8 +458,8 @@ router.post('/procurements', requireAuth, requirePermission('procurement', 'crea
       });
     }
 
-    const grossTotal = subtotal + totalTax - Math.max(0, Number(discount_amount) || 0);
-    const finalDiscountPercent = Number(discount_percent) || (subtotal > 0 && Number(discount_amount) > 0 ? Number(((Number(discount_amount) / subtotal) * 100).toFixed(2)) : 0);
+    const grossTotal = taxableSubtotal + totalTax;
+    const finalDiscountPercent = Number(effectiveDiscPct.toFixed(2));
     const paid = Math.max(0, Number(amount_paid) || 0);
     const initialStatus = 'Sent to Vendor';
 
@@ -475,7 +496,7 @@ router.post('/procurements', requireAuth, requirePermission('procurement', 'crea
       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [
         procId, procNumber, purchase_order_id || null, vendor_id, targetLocationId, rawMaterialFk, processedLines[0].quantity, processedLines[0].rate_per_unit,
-        subtotal, totalTax, discount_amount, finalDiscountPercent, grossTotal, paid, due, date || new Date().toISOString().slice(0, 10), notes, initialStatus,
+        taxableSubtotal, totalTax, finalDiscountAmount, finalDiscountPercent, grossTotal, paid, due, date || new Date().toISOString().slice(0, 10), notes, initialStatus,
         new Date()
       ]
     );
@@ -823,8 +844,17 @@ router.get('/procurements/:id/payments', requireAuth, async (req, res) => {
       }];
     }
 
-    // Ensure amount_due is exact
-    proc.amount_due = Math.max(0, Number(proc.total_amount) - Number(proc.amount_paid));
+    // Ensure financials account for returned goods
+    const dnRes = await req.tenantDb.query('SELECT COALESCE(SUM(total_amount), 0) AS debit_note_total FROM debit_notes WHERE procurement_id = ?', [req.params.id]);
+    const debitNoteTotal = Number(dnRes.rows[0]?.debit_note_total || 0);
+    const fin = getProcurementFinancials(proc, debitNoteTotal);
+    proc.total_amount = fin.original_total;
+    proc.returned_amount = fin.returned_amount;
+    proc.net_total = fin.net_total;
+    proc.amount_paid = fin.amount_paid;
+    proc.amount_due = fin.amount_due;
+    proc.amount_to_return = fin.amount_to_return;
+    proc.payment_status = fin.payment_status;
 
     return res.json({
       procurement: proc,
@@ -859,27 +889,30 @@ router.post('/procurements/:id/payments', requireAuth, requirePermission('procur
     }
 
     const proc = procRes.rows[0];
-    const subtotal = Number(proc.subtotal) || 0;
-    const taxAmount = Number(proc.tax_amount) || 0;
-    const discount = Number(proc.discount_amount) || 0;
-    const fullBill = (subtotal + taxAmount - discount > 0) ? (subtotal + taxAmount - discount) : (Number(proc.total_amount) || 0);
-    const prevPaid = Number(proc.amount_paid) || 0;
-    const currentDue = Math.max(0, fullBill - prevPaid);
+    const dnRes = await req.tenantDb.query('SELECT COALESCE(SUM(total_amount), 0) AS debit_note_total FROM debit_notes WHERE procurement_id = ?', [req.params.id]);
+    const debitNoteTotal = Number(dnRes.rows[0]?.debit_note_total || 0);
+    const fin = getProcurementFinancials(proc, debitNoteTotal);
+    const currentDue = fin.amount_due;
+
+    if (currentDue <= 0.009) {
+      await req.tenantDb.query('ROLLBACK');
+      return res.status(400).json({ error: 'This procurement has no remaining balance due for retained items.' });
+    }
 
     if (payAmt > currentDue + 0.01) {
       await req.tenantDb.query('ROLLBACK');
       return res.status(400).json({ error: `Payment amount cannot exceed the remaining due balance of ₹${currentDue.toFixed(2)}` });
     }
 
-    const newPaid = prevPaid + payAmt;
-    const newDue = Math.max(0, fullBill - newPaid);
+    const newPaid = Number((fin.amount_paid + payAmt).toFixed(2));
+    const newDue = Math.max(0, Number((fin.net_total - newPaid).toFixed(2)));
 
     // Update procurement financial fields
     await req.tenantDb.query(
       `UPDATE procurements
        SET total_amount = ?, amount_paid = ?, amount_due = ?, updated_at = NOW()
        WHERE id = ?`,
-      [fullBill, newPaid, newDue, req.params.id]
+      [fin.original_total, newPaid, newDue, req.params.id]
     );
 
     // Insert into payments_log
@@ -1170,6 +1203,80 @@ router.get('/debit-notes', requireAuth, async (req, res) => {
   }
 });
 
+// Get single Debit Note with full item breakdown and procurement info
+router.get('/debit-notes/:id', requireAuth, async (req, res) => {
+  try {
+    const dnRes = await req.tenantDb.query(
+      `SELECT dn.*, 
+              v.name AS vendor_name, v.vendor_code, v.email AS vendor_email, v.phone AS vendor_phone,
+              p.procurement_number, p.date AS procurement_date, p.total_amount AS procurement_total,
+              p.status AS procurement_status,
+              loc.name AS location_name
+       FROM debit_notes dn
+       LEFT JOIN vendors v ON v.id = dn.vendor_id
+       LEFT JOIN procurements p ON p.id = dn.procurement_id
+       LEFT JOIN locations loc ON loc.id = p.location_id
+       WHERE dn.id = ?`,
+      [req.params.id]
+    );
+
+    if (dnRes.rowCount === 0) {
+      return res.status(404).json({ error: 'Debit note not found' });
+    }
+
+    const dn = dnRes.rows[0];
+
+    // Fetch line items
+    const itemsRes = await req.tenantDb.query(
+      `SELECT dni.*, 
+              COALESCE(i.name, rm.name, 'Item') AS item_name,
+              COALESCE(i.unit, rm.unit, 'pcs') AS unit,
+              COALESCE(i.hsn_code, '') AS hsn_code
+       FROM debit_note_items dni
+       LEFT JOIN items i ON i.id = dni.item_id
+       LEFT JOIN raw_materials rm ON rm.id = dni.item_id
+       WHERE dni.debit_note_id = ?`,
+      [dn.id]
+    );
+
+    dn.items = (itemsRes.rows || []).map((it) => ({
+      ...it,
+      name: it.item_name,
+      rate_per_unit: Number(it.rate_per_unit || 0),
+      quantity: Number(it.quantity || 0),
+      tax_rate: Number(it.tax_rate || 0),
+      line_total: Number(it.line_total || 0)
+    }));
+
+    dn.item_count = dn.items.length;
+    dn.total_amount = Number(dn.total_amount || 0);
+
+    // Build timeline entry
+    dn.timeline = [
+      {
+        kind: 'Debit Note Issued',
+        date: dn.date || dn.created_at,
+        amount: dn.total_amount,
+        notes: `Reason: ${dn.reason || 'Purchase Return'}${dn.notes ? ` · Notes: ${dn.notes}` : ''}`
+      }
+    ];
+
+    if (dn.procurement_number) {
+      dn.timeline.push({
+        kind: 'Related Procurement',
+        date: dn.procurement_date,
+        amount: dn.procurement_total,
+        notes: `Procurement Ref: ${dn.procurement_number} (Status: ${dn.procurement_status || 'Processed'})`
+      });
+    }
+
+    return res.json(dn);
+  } catch (err) {
+    console.error('get debit note detail error', err);
+    return res.status(500).json({ error: 'Failed to fetch debit note details' });
+  }
+});
+
 router.post('/debit-notes', requireAuth, requirePermission('procurement', 'create'), async (req, res) => {
   const { vendor_id, procurement_id, total_amount, reason, notes } = req.body;
   const rawItems = req.body.items || req.body.lines || [];
@@ -1211,6 +1318,39 @@ router.post('/debit-notes', requireAuth, requirePermission('procurement', 'creat
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [crypto.randomUUID(), dnId, item.item_id || item.raw_material_id, qty, rate, taxRate, lineTotal]
       );
+    }
+
+    // Resolve location for inventory ledger deduction
+    let targetLocId = null;
+    if (procurement_id) {
+      const pRes = await req.tenantDb.query('SELECT location_id FROM procurements WHERE id = ?', [procurement_id]);
+      targetLocId = pRes.rows[0]?.location_id || null;
+    }
+    if (!targetLocId) {
+      const defLoc = await req.tenantDb.query('SELECT id FROM locations WHERE is_default = 1 LIMIT 1');
+      targetLocId = defLoc.rows[0]?.id || null;
+    }
+
+    // Deduct stock in inventory_ledger for returned goods
+    for (const item of items) {
+      const itemId = item.item_id || item.raw_material_id;
+      const qty = Math.max(0, Number(item.quantity) || 0);
+      if (!itemId || qty <= 0) continue;
+      await req.tenantDb.query(
+        `INSERT INTO inventory_ledger
+           (id, item_type, item_id, location_id, transaction_type, quantity, reference_table, reference_id, reason, created_by, date)
+         VALUES (?, 'raw_material', ?, ?, 'out', ?, 'debit_notes', ?, 'Debit Note created (material returned)', ?, ?)`,
+        [crypto.randomUUID(), itemId, targetLocId, qty, dnId, req.user?.id || null, date]
+      );
+    }
+
+    // If linked to procurement, update procurement status
+    if (procurement_id) {
+      const piSumRes = await req.tenantDb.query('SELECT COALESCE(SUM(quantity), 0) AS total_qty FROM procurement_items WHERE procurement_id = ?', [procurement_id]);
+      const totalProcQty = Number(piSumRes.rows[0]?.total_qty || 0);
+      const totalReturnedQty = items.reduce((s, i) => s + (Number(i.quantity) || 0), 0);
+      const newStatus = (totalProcQty > 0 && totalReturnedQty >= totalProcQty - 0.001) ? 'Returned' : 'Partially Returned';
+      await req.tenantDb.query('UPDATE procurements SET status = ?, updated_at = NOW() WHERE id = ?', [newStatus, procurement_id]);
     }
 
     await req.tenantDb.query('COMMIT');
@@ -1338,25 +1478,38 @@ router.post('/vendor-return-requests/:id/accept', requireAuth, async (req, res) 
   const vendorId = req.user.vendor_id;
   if (!vendorId) return res.status(403).json({ error: 'Vendor access only' });
 
+  const client = await req.tenantDb.connect();
   try {
-    const rrRes = await req.tenantDb.query(
-      'SELECT id, vendor_id, status FROM return_requests WHERE id = ?',
+    await client.query('START TRANSACTION');
+
+    const rrRes = await client.query(
+      'SELECT id, vendor_id, status FROM return_requests WHERE id = ? FOR UPDATE',
       [req.params.id]
     );
-    if (rrRes.rowCount === 0) return res.status(404).json({ error: 'Return request not found' });
-    if (rrRes.rows[0].vendor_id !== vendorId) return res.status(403).json({ error: 'Access denied' });
+    if (rrRes.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Return request not found' });
+    }
+    if (rrRes.rows[0].vendor_id !== vendorId) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Access denied' });
+    }
 
-    await req.tenantDb.query(
-      `UPDATE return_requests
-       SET status = 'Approved', review_notes = ?, reviewed_by = ?, reviewed_at = NOW(), updated_at = NOW()
-       WHERE id = ?`,
-      [req.body.notes || 'Accepted by vendor', req.user.id, req.params.id]
+    await executeApproveReturnRequest(
+      client,
+      req.params.id,
+      req.user.id,
+      req.body.notes || 'Accepted by vendor'
     );
 
-    return res.json({ ok: true, message: 'Return request accepted' });
+    await client.query('COMMIT');
+    return res.json({ ok: true, message: 'Return request accepted and inventory updated' });
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('vendor accept return error', err);
     return res.status(500).json({ error: 'Failed to accept return request' });
+  } finally {
+    client.release();
   }
 });
 

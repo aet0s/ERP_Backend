@@ -195,8 +195,8 @@ function validatePartyInput({ name, code, phone, email, pincode, gstin, pan, ban
   }
   if (phone !== undefined && phone !== null && String(phone).trim() !== '') {
     const digits = String(phone).replace(/\D/g, '');
-    if (digits.length < 10 || digits.length > 15) {
-      return 'Primary phone number must contain 10 to 15 digits';
+    if (digits.length !== 10) {
+      return 'Mobile number must contain exactly 10 digits';
     }
   }
   if (email !== undefined && email !== null && String(email).trim() !== '') {
@@ -216,8 +216,9 @@ function validatePartyInput({ name, code, phone, email, pincode, gstin, pan, ban
     }
   }
   if (pan !== undefined && pan !== null && String(pan).trim() !== '') {
+    const cleanPan = String(pan).trim().toUpperCase();
     const panRegex = /^[A-Z]{5}[0-9]{4}[A-Z]{1}$/;
-    if (!panRegex.test(String(pan).trim().toUpperCase())) {
+    if (cleanPan.length !== 10 || !panRegex.test(cleanPan)) {
       return 'Invalid 10-character PAN format (e.g. ABCDE1234F)';
     }
   }
