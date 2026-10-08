@@ -3,7 +3,7 @@ const router = express.Router();
 const crypto = require('crypto');
 const { requireAuth, requireRole, requirePermission } = require('../middleware/auth');
 const { getNextDocumentNumber } = require('../lib/invoiceEngine');
-const { getWeightedAvgCost } = require('../lib/analytics');
+const { getWeightedAvgCost, numeric } = require('../lib/analytics');
 const { createNotification } = require('../lib/notifications');
 const { executeApproveReturnRequest, getProcurementFinancials } = require('../lib/returnsEngine');
 
@@ -415,13 +415,13 @@ router.post('/procurements', requireAuth, requirePermission('procurement', 'crea
 
   try {
     const procNumber = await getNextDocumentNumber(req.tenantDb, 'procurement');
-    const discPct = Math.min(100, Math.max(0, Number(discount_percent) || 0));
-    const rawDiscAmount = Math.max(0, Number(discount_amount) || 0);
+    const discPct = Math.min(100, Math.max(0, numeric(discount_percent)));
+    const rawDiscAmount = Math.max(0, numeric(discount_amount));
 
     let grossSubtotal = 0;
     for (const item of items) {
-      const qty = Math.max(0, Number(item.quantity) || 0);
-      const rate = Math.max(0, Number(item.rate_per_unit || item.rate) || 0);
+      const qty = Math.max(0, numeric(item.quantity));
+      const rate = Math.max(0, numeric(item.rate_per_unit || item.rate));
       grossSubtotal += qty * rate;
     }
 
@@ -435,9 +435,9 @@ router.post('/procurements', requireAuth, requirePermission('procurement', 'crea
 
     for (const item of items) {
       const itemId = item.item_id || item.raw_material_id;
-      const qty = Math.max(0, Number(item.quantity) || 0);
-      const rate = Math.max(0, Number(item.rate_per_unit || item.rate) || 0);
-      const taxRate = Math.max(0, Number(item.tax_rate) || 0);
+      const qty = Math.max(0, numeric(item.quantity));
+      const rate = Math.max(0, numeric(item.rate_per_unit || item.rate));
+      const taxRate = Math.max(0, numeric(item.tax_rate));
 
       // Discount is given on MRP (qty * rate) first, and then GST or Tax is calculated on that discounted MRP:
       const lineGross = qty * rate;
@@ -460,8 +460,9 @@ router.post('/procurements', requireAuth, requirePermission('procurement', 'crea
 
     const grossTotal = taxableSubtotal + totalTax;
     const finalDiscountPercent = Number(effectiveDiscPct.toFixed(2));
-    const paid = Math.max(0, Number(amount_paid) || 0);
-    const initialStatus = 'Sent to Vendor';
+    const paid = Math.max(0, numeric(amount_paid));
+    const isReceiveNow = Boolean(req.body.receive_immediately || req.body.status === 'Received');
+    const initialStatus = isReceiveNow ? 'Received' : 'Sent to Vendor';
 
     await req.tenantDb.query('START TRANSACTION');
     const procId = crypto.randomUUID();
@@ -492,12 +493,12 @@ router.post('/procurements', requireAuth, requirePermission('procurement', 'crea
     await req.tenantDb.query(
       `INSERT INTO procurements (
         id, procurement_number, purchase_order_id, vendor_id, location_id, raw_material_id, quantity, rate_per_unit,
-        subtotal, tax_amount, discount_amount, discount_percent, total_amount, amount_paid, amount_due, date, notes, status, sent_at
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        subtotal, tax_amount, discount_amount, discount_percent, total_amount, amount_paid, amount_due, date, notes, status, sent_at, received_date
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [
         procId, procNumber, purchase_order_id || null, vendor_id, targetLocationId, rawMaterialFk, processedLines[0].quantity, processedLines[0].rate_per_unit,
         taxableSubtotal, totalTax, finalDiscountAmount, finalDiscountPercent, grossTotal, paid, due, date || new Date().toISOString().slice(0, 10), notes, initialStatus,
-        new Date()
+        new Date(), isReceiveNow ? new Date() : null
       ]
     );
 
@@ -519,6 +520,24 @@ router.post('/procurements', requireAuth, requirePermission('procurement', 'crea
            updated_at = NOW()`,
         [crypto.randomUUID(), vendor_id, line.item_id, line.rate_per_unit, date || new Date().toISOString().slice(0, 10)]
       ).catch(() => {});
+    }
+
+    // If receive_immediately is true, record stock in inventory_ledger right now
+    if (isReceiveNow) {
+      const userId = req.user.user_id || req.user.id || null;
+      for (const line of processedLines) {
+        const ledgerId = crypto.randomUUID();
+        await req.tenantDb.query(
+          `INSERT INTO inventory_ledger (
+            id, item_type, item_id, transaction_type, quantity, unit_cost, location_id, reason, reference_table, reference_id, created_by, date
+          ) VALUES (?, 'raw_material', ?, 'in', ?, ?, ?, ?, 'procurements', ?, ?, ?)`,
+          [ledgerId, line.item_id, line.quantity, line.rate_per_unit, targetLocationId, `Procurement Received ${procNumber}`, procId, userId, date || new Date().toISOString().slice(0, 10)]
+        );
+
+        const newWeightedAvg = await getWeightedAvgCost(req.tenantDb, line.item_id);
+        await req.tenantDb.query('UPDATE items SET last_purchase_price = ?, updated_at = NOW() WHERE id = ?', [newWeightedAvg, line.item_id]).catch(() => {});
+        await req.tenantDb.query('UPDATE raw_materials SET last_purchase_price = ?, updated_at = NOW() WHERE id = ?', [newWeightedAvg, line.item_id]).catch(() => {});
+      }
     }
 
     // Record initial advance / payment in payments_log if paid > 0
@@ -599,14 +618,32 @@ router.post('/procurements/:id/vendor-confirm-return', requireAuth, async (req, 
       [req.params.id]
     );
 
-    // Update return request status if exists
+    // Update return request status if exists and ensure return is approved/processed
+    const rrRes = await req.tenantDb.query(
+      "SELECT id FROM return_requests WHERE reference_id = ? AND request_type = 'purchase_return' LIMIT 1",
+      [req.params.id]
+    );
+    if (rrRes.rows.length > 0) {
+      const client = await req.tenantDb.connect();
+      try {
+        await client.query('START TRANSACTION');
+        await executeApproveReturnRequest(client, rrRes.rows[0].id, req.user?.id || req.user?.user_id, 'Vendor confirmed physical receipt of returned goods');
+        await client.query('COMMIT');
+      } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.warn('executeApproveReturnRequest in vendor-confirm-return non-fatal warning:', e.message);
+      } finally {
+        client.release();
+      }
+    }
+
     await req.tenantDb.query(
       "UPDATE return_requests SET status = 'Received by Vendor', updated_at = NOW() WHERE reference_id = ?",
       [req.params.id]
     );
 
     await req.tenantDb.query('COMMIT');
-    return res.json({ ok: true, message: 'Vendor confirmed physical receipt of returned goods' });
+    return res.json({ ok: true, message: 'Vendor confirmed physical receipt of returned goods and inventory updated' });
   } catch (err) {
     await req.tenantDb.query('ROLLBACK').catch(() => {});
     console.error('vendor confirm return error', err);
@@ -868,7 +905,7 @@ router.get('/procurements/:id/payments', requireAuth, async (req, res) => {
 
 router.post('/procurements/:id/payments', requireAuth, requirePermission('procurement', 'create'), async (req, res) => {
   const { amount, date, notes } = req.body;
-  const payAmt = Math.max(0, Number(amount) || 0);
+  const payAmt = Math.max(0, numeric(amount));
   if (payAmt <= 0) {
     return res.status(400).json({ error: 'Valid positive payment amount is required' });
   }
@@ -1338,9 +1375,9 @@ router.post('/debit-notes', requireAuth, requirePermission('procurement', 'creat
       if (!itemId || qty <= 0) continue;
       await req.tenantDb.query(
         `INSERT INTO inventory_ledger
-           (id, item_type, item_id, location_id, transaction_type, quantity, reference_table, reference_id, reason, created_by, date)
-         VALUES (?, 'raw_material', ?, ?, 'out', ?, 'debit_notes', ?, 'Debit Note created (material returned)', ?, ?)`,
-        [crypto.randomUUID(), itemId, targetLocId, qty, dnId, req.user?.id || null, date]
+           (id, item_type, item_id, location_id, transaction_type, quantity, unit_cost, reference_table, reference_id, reason, created_by, date)
+         VALUES (?, 'raw_material', ?, ?, 'out', ?, ?, 'debit_notes', ?, 'Debit Note created (material returned)', ?, ?)`,
+        [crypto.randomUUID(), itemId, targetLocId, qty, Number(item.rate_per_unit || 0), dnId, req.user?.id || null, date]
       );
     }
 
@@ -1364,6 +1401,8 @@ router.post('/debit-notes', requireAuth, requirePermission('procurement', 'creat
 
 router.delete('/debit-notes/:id', requireAuth, requirePermission('procurement', 'delete'), async (req, res) => {
   try {
+    await req.tenantDb.query("DELETE FROM inventory_ledger WHERE reference_table = 'debit_notes' AND reference_id = ?", [req.params.id]);
+    await req.tenantDb.query('DELETE FROM debit_note_items WHERE debit_note_id = ?', [req.params.id]);
     await req.tenantDb.query('DELETE FROM debit_notes WHERE id = ?', [req.params.id]);
     return res.json({ success: true });
   } catch (err) {

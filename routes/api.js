@@ -151,19 +151,20 @@ async function ensureWorkspaceRecord(client, table, id, extra = '') {
   return result.rows[0] || null;
 }
 
-async function stockForItem(client, itemType, itemId) {
-  const result = await client.query(
-    `SELECT COALESCE(SUM(CASE
+async function stockForItem(client, itemType, itemId, locationId = null) {
+  const query = `SELECT COALESCE(SUM(CASE
        WHEN transaction_type = 'in' THEN quantity
        WHEN transaction_type = 'out' THEN -quantity
        ELSE quantity
      END),0) AS current_stock
      FROM inventory_ledger
-     WHERE item_type = ? AND item_id = ?`,
-    [itemType, itemId]
-  );
+     WHERE item_type = ? AND item_id = ?
+     ${locationId ? 'AND location_id = ?' : ''}`;
+  const params = locationId ? [itemType, itemId, locationId] : [itemType, itemId];
+  const result = await client.query(query, params);
   return numeric(result.rows[0]?.current_stock);
 }
+
 
 async function detailTimeline(tenantDb, referenceTable, referenceId) {
   const [ledger, payments] = await Promise.all([
@@ -924,6 +925,9 @@ registerMasterTable('raw-materials', 'raw_materials', ['name', 'unit'], { name: 
 
 router.get('/finished-goods', requireAuth, async (req, res) => {
   try {
+    const rawLocId = req.query.location_id;
+    const locationId = rawLocId && rawLocId !== 'undefined' && rawLocId !== 'null' && String(rawLocId).trim() !== '' ? String(rawLocId).trim() : null;
+
     const params = [];
     const where = ['fg.deleted_at IS NULL'];
     if (req.query.search) {
@@ -931,27 +935,35 @@ router.get('/finished-goods', requireAuth, async (req, res) => {
       where.push(`fg.name LIKE ?`);
     }
 
-    const fgStockSub = `COALESCE((SELECT SUM(CASE WHEN il.transaction_type = 'in' THEN il.quantity ELSE -il.quantity END) FROM inventory_ledger il WHERE il.item_type = 'finished_good' AND il.item_id = fg.id), 0)`;
+    let fgStockSub = `COALESCE((SELECT SUM(CASE WHEN il.transaction_type = 'in' THEN il.quantity ELSE -il.quantity END) FROM inventory_ledger il WHERE il.item_type = 'finished_good' AND il.item_id = fg.id), 0)`;
+    if (locationId) {
+      fgStockSub = `COALESCE((SELECT SUM(CASE WHEN il.transaction_type = 'in' THEN il.quantity ELSE -il.quantity END) FROM inventory_ledger il WHERE il.item_type = 'finished_good' AND il.item_id = fg.id AND il.location_id = ?), 0)`;
+    }
 
+    const whereParams = [...params];
     if (req.query.stock_status === 'in_stock') {
       where.push(`${fgStockSub} > 0`);
+      if (locationId) whereParams.push(locationId);
     } else if (req.query.stock_status === 'low_stock') {
       where.push(`${fgStockSub} <= fg.reorder_level AND fg.reorder_level IS NOT NULL AND fg.reorder_level > 0`);
+      if (locationId) whereParams.push(locationId);
     } else if (req.query.stock_status === 'out_of_stock') {
       where.push(`${fgStockSub} <= 0`);
+      if (locationId) whereParams.push(locationId);
     }
 
     // Get total count first
     const countRes = await req.tenantDb.query(
       `SELECT COUNT(*) AS count FROM finished_goods fg WHERE ${where.join(' AND ')}`,
-      params
+      whereParams
     );
     const total = Number(countRes.rows[0]?.count || countRes.rows[0]?.['COUNT(*)'] || 0);
 
     // Pagination
     const isTable = isTableRequest(req);
     const { pageSize, offset } = pageParams(req);
-    const queryParams = [...params];
+    const selectParams = locationId ? [locationId, locationId] : [];
+    const queryParams = [...selectParams, ...whereParams];
     let mainQuery = `
       SELECT fg.*,
         ${fgStockSub} AS available_stock,
@@ -970,6 +982,8 @@ router.get('/finished-goods', requireAuth, async (req, res) => {
     const fgIds = result.rows.map((r) => r.id);
     if (fgIds.length > 0) {
       const placeholders = fgIds.map(() => '?').join(',');
+      const pkgStockParams = locationId ? [...fgIds, locationId] : fgIds;
+      const looseStockParams = locationId ? [...fgIds, locationId] : fgIds;
       const [levelsRes, pkgStockRes, looseStockRes] = await Promise.all([
         req.tenantDb.query(
           `SELECT ppl.*, 
@@ -993,8 +1007,9 @@ router.get('/finished-goods', requireAuth, async (req, res) => {
              ), 0) AS packaged_stock
            FROM inventory_ledger
            WHERE item_type = 'finished_good' AND item_id IN (${placeholders}) AND packaging_level_id IS NOT NULL
+           ${locationId ? 'AND location_id = ?' : ''}
            GROUP BY item_id, packaging_level_id`,
-          fgIds
+          pkgStockParams
         ).catch(() => ({ rows: [] })),
         req.tenantDb.query(
           `SELECT 
@@ -1006,8 +1021,9 @@ router.get('/finished-goods', requireAuth, async (req, res) => {
              ), 0) AS loose_stock
            FROM inventory_ledger
            WHERE item_type = 'finished_good' AND item_id IN (${placeholders}) AND packaging_level_id IS NULL
+           ${locationId ? 'AND location_id = ?' : ''}
            GROUP BY item_id`,
-          fgIds
+          looseStockParams
         ).catch(() => ({ rows: [] }))
       ]);
 
@@ -1858,10 +1874,11 @@ router.post('/sales', requireAuth, requirePermission('sales', 'create'), async (
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'finished_good_id not found' });
     }
-    const currentStock = await stockForItem(client, 'finished_good', finished_good_id);
+    const targetLocId = location_id || req.body.location_id || null;
+    const currentStock = await stockForItem(client, 'finished_good', finished_good_id, targetLocId);
     if (!allow_negative && qty.value > currentStock) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Insufficient stock', current_stock: currentStock });
+      return res.status(400).json({ error: 'Insufficient stock in selected warehouse', current_stock: currentStock });
     }
 
     // 1. Fetch Company & Customer State for GST Split (CGST+SGST vs IGST)
@@ -2593,55 +2610,205 @@ router.get('/inventory/:item_type/:item_id/details', requireAuth, requirePermiss
       [item_type, item_id]
     );
 
-    // Vendor purchase price breakdown for raw materials
+    // Vendor purchase price breakdown and multi-vendor WAC for raw materials & goods
     let vendorPurchases = [];
+    let vendorBreakdown = [];
     let vendorPricingSummary = null;
+    let wacBreakdown = null;
 
-    if (item_type === 'raw_material') {
+    if (item_type === 'raw_material' || item_type === 'finished_good') {
+      // Find all aliased IDs for this item (across items and raw_materials by ID or matching name)
+      const matchRes = await req.tenantDb.query(
+        `SELECT id FROM items WHERE id = ?
+         UNION
+         SELECT id FROM items WHERE name = (SELECT name FROM items WHERE id = ?)
+         UNION
+         SELECT id FROM items WHERE name = (SELECT name FROM raw_materials WHERE id = ?)
+         UNION
+         SELECT id FROM raw_materials WHERE id = ?
+         UNION
+         SELECT id FROM raw_materials WHERE name = (SELECT name FROM items WHERE id = ?)
+         UNION
+         SELECT id FROM raw_materials WHERE name = (SELECT name FROM raw_materials WHERE id = ?)`,
+        [item_id, item_id, item_id, item_id, item_id, item_id]
+      ).catch(() => ({ rows: [] }));
+      const ids = matchRes.rows.length > 0 ? matchRes.rows.map(r => r.id) : [item_id];
+      const placeholders = ids.map(() => '?').join(',');
+
+      // 1. Fetch procurement items
       const vPurchasesRes = await req.tenantDb.query(
         `SELECT pi.quantity, pi.rate_per_unit, (pi.quantity * pi.rate_per_unit) AS total_amount,
-                p.procurement_number, p.date,
-                COALESCE(v.name, 'Direct Vendor') AS vendor_name, v.id AS vendor_id
+                p.procurement_number, p.date, p.status,
+                COALESCE(v.name, 'Direct Vendor') AS vendor_name, v.id AS vendor_id, v.vendor_code
          FROM procurement_items pi
          JOIN procurements p ON p.id = pi.procurement_id
          LEFT JOIN vendors v ON v.id = p.vendor_id
-         WHERE (pi.item_id = ? OR pi.item_id IN (SELECT id FROM items WHERE id = ? OR name = (SELECT name FROM raw_materials WHERE id = ?)))
-           AND p.deleted_at IS NULL
-         ORDER BY p.date DESC, p.created_at DESC
-         LIMIT 25`,
-        [item_id, item_id, item_id]
+         WHERE pi.item_id IN (${placeholders})
+           AND p.deleted_at IS NULL AND (p.status IS NULL OR p.status != 'Cancelled')
+         ORDER BY p.date DESC, p.created_at DESC`,
+        ids
       ).catch(() => ({ rows: [] }));
 
-      vendorPurchases = vPurchasesRes.rows;
+      // 2. Fetch direct procurements where procurement_items may not exist
+      const directPurchasesRes = await req.tenantDb.query(
+        `SELECT p.quantity, p.rate_per_unit, (p.quantity * p.rate_per_unit) AS total_amount,
+                p.procurement_number, p.date, p.status,
+                COALESCE(v.name, 'Direct Vendor') AS vendor_name, v.id AS vendor_id, v.vendor_code
+         FROM procurements p
+         LEFT JOIN vendors v ON v.id = p.vendor_id
+         WHERE p.raw_material_id IN (${placeholders})
+           AND p.deleted_at IS NULL AND (p.status IS NULL OR p.status != 'Cancelled')
+           AND p.id NOT IN (SELECT procurement_id FROM procurement_items WHERE item_id IN (${placeholders}))
+         ORDER BY p.date DESC, p.created_at DESC`,
+        [...ids, ...ids]
+      ).catch(() => ({ rows: [] }));
+
+      // 3. Fetch opening stock / manual inventory ledger additions with cost
+      const ledgerInRes = await req.tenantDb.query(
+        `SELECT il.quantity, il.unit_cost AS rate_per_unit, (il.quantity * il.unit_cost) AS total_amount,
+                'OPENING-STOCK' AS procurement_number, il.date, 'Received' AS status,
+                COALESCE(NULLIF(il.reason, ''), 'Opening / Existing Stock') AS vendor_name,
+                NULL AS vendor_id, NULL AS vendor_code
+         FROM inventory_ledger il
+         WHERE il.item_id IN (${placeholders})
+           AND il.transaction_type = 'in' AND il.unit_cost > 0
+           AND il.reference_table != 'stock_transfers'
+           AND il.reference_table != 'procurements'
+           AND (il.reason IS NULL OR (il.reason NOT LIKE '%reversal%' AND il.reason NOT LIKE '%correction%'))
+         ORDER BY il.date ASC, il.created_at ASC`,
+        ids
+      ).catch(() => ({ rows: [] }));
+
+      const rawEntries = [
+        ...(vPurchasesRes.rows || []),
+        ...(directPurchasesRes.rows || []),
+        ...(ledgerInRes.rows || [])
+      ].filter(p => Number(p.quantity || 0) > 0 && Number(p.rate_per_unit || 0) > 0);
+
+      // Sort chronological descending (most recent first)
+      rawEntries.sort((a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime());
+
+      const totalQty = rawEntries.reduce((acc, p) => acc + Number(p.quantity || 0), 0);
+      const totalVal = rawEntries.reduce((acc, p) => acc + (Number(p.quantity || 0) * Number(p.rate_per_unit || 0)), 0);
+      const calculatedWac = totalQty > 0 ? (totalVal / totalQty) : 0;
+
+      // Calculate contribution and weight % for each individual entry
+      vendorPurchases = rawEntries.map(p => {
+        const qty = Number(p.quantity || 0);
+        const rate = Number(p.rate_per_unit || 0);
+        const amount = qty * rate;
+        const weightPct = totalQty > 0 ? (qty / totalQty) * 100 : 0;
+        const wacContribution = totalQty > 0 ? (amount / totalQty) : 0;
+        const costPct = totalVal > 0 ? (amount / totalVal) * 100 : 0;
+
+        return {
+          vendor_id: p.vendor_id || null,
+          vendor_name: p.vendor_name || 'Direct Vendor',
+          vendor_code: p.vendor_code || null,
+          procurement_number: p.procurement_number || '—',
+          date: p.date,
+          status: p.status || 'Received',
+          quantity: qty,
+          rate_per_unit: rate,
+          total_amount: amount,
+          weight_percentage: Number(weightPct.toFixed(2)),
+          wac_contribution: Number(wacContribution.toFixed(2)),
+          cost_percentage: Number(costPct.toFixed(2))
+        };
+      });
+
+      // Group by vendor for aggregated vendor breakdown
+      const vendorMap = new Map();
+      for (const p of vendorPurchases) {
+        const vKey = p.vendor_id || p.vendor_name;
+        if (!vendorMap.has(vKey)) {
+          vendorMap.set(vKey, {
+            vendor_id: p.vendor_id,
+            vendor_name: p.vendor_name,
+            vendor_code: p.vendor_code,
+            total_quantity: 0,
+            total_amount: 0,
+            purchase_count: 0,
+            rates: []
+          });
+        }
+        const vData = vendorMap.get(vKey);
+        vData.total_quantity += p.quantity;
+        vData.total_amount += p.total_amount;
+        vData.purchase_count += 1;
+        vData.rates.push(p.rate_per_unit);
+      }
+
+      vendorBreakdown = Array.from(vendorMap.values()).map(v => {
+        const avgRate = v.total_quantity > 0 ? (v.total_amount / v.total_quantity) : 0;
+        const weightPct = totalQty > 0 ? (v.total_quantity / totalQty) * 100 : 0;
+        const wacContrib = totalQty > 0 ? (v.total_amount / totalQty) : 0;
+        const costPct = totalVal > 0 ? (v.total_amount / totalVal) * 100 : 0;
+
+        return {
+          vendor_id: v.vendor_id,
+          vendor_name: v.vendor_name,
+          vendor_code: v.vendor_code,
+          total_quantity: v.total_quantity,
+          average_rate: Number(avgRate.toFixed(2)),
+          total_amount: Number(v.total_amount.toFixed(2)),
+          purchase_count: v.purchase_count,
+          min_rate: Math.min(...v.rates),
+          max_rate: Math.max(...v.rates),
+          quantity_percentage: Number(weightPct.toFixed(2)),
+          wac_contribution: Number(wacContrib.toFixed(2)),
+          cost_percentage: Number(costPct.toFixed(2))
+        };
+      });
+
+      // Sort vendors by total quantity supplied descending
+      vendorBreakdown.sort((a, b) => b.total_quantity - a.total_quantity);
 
       if (vendorPurchases.length > 0) {
         const rates = vendorPurchases.map(p => Number(p.rate_per_unit)).filter(r => r > 0);
-        const totalQty = vendorPurchases.reduce((acc, p) => acc + Number(p.quantity || 0), 0);
-        const totalVal = vendorPurchases.reduce((acc, p) => acc + (Number(p.quantity || 0) * Number(p.rate_per_unit || 0)), 0);
         const distinctVendors = new Set(vendorPurchases.map(p => p.vendor_name)).size;
 
         vendorPricingSummary = {
-          weighted_avg_cost: totalQty > 0 ? totalVal / totalQty : (rates[0] || 0),
+          weighted_avg_cost: Number(calculatedWac.toFixed(2)),
           last_purchase_price: rates[0] || 0,
           min_price: rates.length > 0 ? Math.min(...rates) : 0,
           max_price: rates.length > 0 ? Math.max(...rates) : 0,
           distinct_vendors_count: distinctVendors,
           total_procured_qty: totalQty,
-          total_procured_amount: totalVal
+          total_procured_amount: totalVal,
+          has_multiple_vendors: distinctVendors > 1 || rates.length > 1
+        };
+
+        wacBreakdown = {
+          calculated_wac: Number(calculatedWac.toFixed(2)),
+          total_inward_qty: totalQty,
+          total_inward_cost: totalVal,
+          distinct_vendors_count: distinctVendors,
+          entries_count: vendorPurchases.length,
+          formula_text: `Total Cost (₹${totalVal.toLocaleString('en-IN', { maximumFractionDigits: 2 })}) ÷ Total Quantity (${totalQty.toLocaleString('en-IN', { maximumFractionDigits: 2 })} ${item.unit || 'units'}) = ₹${calculatedWac.toFixed(2)} / ${item.unit || 'unit'}`
         };
       }
     }
 
+    const finalUnitCost = (vendorPricingSummary && vendorPricingSummary.weighted_avg_cost > 0)
+      ? vendorPricingSummary.weighted_avg_cost
+      : item.unit_cost;
+
     return res.json({
       ...item,
+      unit_cost: finalUnitCost,
+      weighted_avg_cost: finalUnitCost,
+      value_at_cost: Number((item.current_stock * finalUnitCost).toFixed(2)),
       locations: locRows.rows,
       history: historyRes.rows,
       vendor_purchases: vendorPurchases,
-      vendor_pricing_summary: vendorPricingSummary
+      vendor_breakdown: vendorBreakdown,
+      vendor_pricing_summary: vendorPricingSummary,
+      wac_breakdown: wacBreakdown
     });
   } catch (err) {
     console.error('get inventory details error:', err);
-    return res.status(500).json({ error: 'Failed to fetch inventory item details' });
+    return res.status(500).json({ error: 'Failed to fetch inventory item details: ' + err.message });
   }
 });
 

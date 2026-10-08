@@ -8,9 +8,11 @@ const { getTenantPool } = require('../db/tenantManager');
 const authRoute = require('./auth');
 const { issueAccessToken, buildRefreshToken, persistRefreshToken, setAuthCookies, parseRoles } = authRoute;
 const { getFrontendBaseUrl } = require('../lib/urlUtils');
+const { normaliseAssignment, resolveUserRoles, ASSIGNABLE_ROLES } = require('../lib/roles');
+const { ensureDefaultRolePermissions } = require('../lib/defaultPermissions');
 
 const BCRYPT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || '12', 10);
-const VALID_ROLES = ['owner', 'admin', 'manager', 'accounts', 'production_manager', 'sales_manager', 'staff'];
+const VALID_ROLES = ASSIGNABLE_ROLES;
 
 // List users in company
 router.get('/', requireAuth, requirePermission('users', 'view'), async (req, res) => {
@@ -205,9 +207,15 @@ router.post('/', requireAuth, requirePermission('users', 'create'), async (req, 
 // Update user roles
 router.put('/:id/role', requireAuth, requirePermission('users', 'edit'), async (req, res) => {
   const { role, roles } = req.body;
-  const assignedRoles = Array.isArray(roles) && roles.length > 0 ? roles : (role ? [role] : ['staff']);
-  const primaryRole = assignedRoles[0] || 'staff';
-  const rolesString = assignedRoles.join(',');
+  const { primaryRole, assignedRoles, rolesString } = normaliseAssignment(role, roles);
+
+  // Reject roles not in ASSIGNABLE_ROLES (400)
+  for (const r of assignedRoles) {
+    if (!ASSIGNABLE_ROLES.includes(r)) {
+      return res.status(400).json({ error: `Unknown or unassignable role: '${r}'` });
+    }
+  }
+
   const companyId = req.user.company_id || req.user.workspace_id;
   const targetId = req.params.id;
 
@@ -250,9 +258,17 @@ router.put('/:id/role', requireAuth, requirePermission('users', 'edit'), async (
     }
 
     await req.tenantDb.query('UPDATE users SET role = ?, roles = ? WHERE id = ?', [primaryRole, rolesString, targetId]);
-    await queryMaster('UPDATE company_users SET role = ?, roles = ? WHERE user_id = ?', [primaryRole, rolesString, targetId]);
+    await queryMaster('UPDATE company_users SET role = ?, roles = ? WHERE user_id = ? AND company_id = ?', [primaryRole, rolesString, targetId, companyId]);
 
-    return res.json({ ok: true, role: primaryRole, roles: assignedRoles });
+    // Ensure default permissions are applied
+    await ensureDefaultRolePermissions(req.tenantDb);
+
+    // Read stored role back from the database for the response
+    const readBack = await req.tenantDb.query('SELECT role, roles FROM users WHERE id = ?', [targetId]);
+    const storedUser = readBack.rows[0] || {};
+    const finalRoles = resolveUserRoles(storedUser.role, storedUser.roles);
+
+    return res.json({ ok: true, role: storedUser.role || primaryRole, roles: finalRoles });
   } catch (err) {
     console.error('update user role error', err);
     return res.status(500).json({ error: 'Failed to update user roles' });

@@ -7,6 +7,7 @@ const { streamInvoicePdf } = require('../lib/pdfInvoice');
 const { queryMaster } = require('../db/masterDb');
 const { createNotification } = require('../lib/notifications');
 const { getSaleFinancials } = require('../lib/returnsEngine');
+const { numeric } = require('../lib/analytics');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CUSTOMER ORDER PROCESS CHAIN & SALES INVOICES
@@ -572,6 +573,27 @@ router.post('/', requireAuth, requirePermission('sales', 'create'), async (req, 
       }
     }
 
+    let targetLocationId = (req.body.location_id && req.body.location_id !== 'undefined' && req.body.location_id !== 'null' && String(req.body.location_id).trim() !== '')
+      ? String(req.body.location_id).trim()
+      : null;
+    if (!targetLocationId) {
+      const defLocRes = await req.tenantDb.query('SELECT id FROM locations WHERE is_default = 1 AND deleted_at IS NULL LIMIT 1').catch(() => ({ rows: [] }));
+      if (defLocRes.rows.length > 0) {
+        targetLocationId = defLocRes.rows[0].id;
+      } else {
+        const anyLocRes = await req.tenantDb.query('SELECT id FROM locations WHERE deleted_at IS NULL LIMIT 1').catch(() => ({ rows: [] }));
+        if (anyLocRes.rows.length > 0) {
+          targetLocationId = anyLocRes.rows[0].id;
+        }
+      }
+    }
+
+    let locName = 'selected warehouse';
+    if (targetLocationId) {
+      const locNameRes = await req.tenantDb.query('SELECT name FROM locations WHERE id = ?', [targetLocationId]).catch(() => ({ rows: [] }));
+      if (locNameRes.rows[0]?.name) locName = locNameRes.rows[0].name;
+    }
+
     const calculatedLines = [];
     for (const item of items) {
       const fgId = item.finished_good_id || item.item_id;
@@ -592,41 +614,45 @@ router.post('/', requireAuth, requirePermission('sales', 'create'), async (req, 
           unitsPerPkg = Number(pkg.base_quantity_equivalent) || 1;
         }
 
-        // Validate available packaged stock specifically for this packaging level
-        const pkgStockRes = await req.tenantDb.query(
-          `SELECT COALESCE(SUM(
+        // Validate available packaged stock specifically for this packaging level in the target warehouse
+        const pkgStockQuery = `SELECT COALESCE(SUM(
              CASE WHEN transaction_type = 'in' THEN COALESCE(package_count, quantity / ?)
                   WHEN transaction_type = 'out' THEN -COALESCE(package_count, quantity / ?)
                   ELSE 0 END
            ), 0) AS avail_pkg_stock
            FROM inventory_ledger
-           WHERE item_type = 'finished_good' AND item_id = ? AND packaging_level_id = ?`,
-          [unitsPerPkg, unitsPerPkg, fgId, pkgConfigId]
-        );
+           WHERE item_type = 'finished_good' AND item_id = ? AND packaging_level_id = ?
+           ${targetLocationId ? 'AND location_id = ?' : ''}`;
+        const pkgStockParams = targetLocationId
+          ? [unitsPerPkg, unitsPerPkg, fgId, pkgConfigId, targetLocationId]
+          : [unitsPerPkg, unitsPerPkg, fgId, pkgConfigId];
+
+        const pkgStockRes = await req.tenantDb.query(pkgStockQuery, pkgStockParams);
         const availPkgStock = Math.max(0, Number(pkgStockRes.rows[0]?.avail_pkg_stock || 0));
         const reqQty = Number(item.quantity) || 0;
         if (reqQty > availPkgStock) {
           return res.status(400).json({
-            error: `Cannot sell ${reqQty} ${pkgName || 'packages'} of "${fgName}". Only ${availPkgStock} available in packaged stock.`
+            error: `Cannot sell ${reqQty} ${pkgName || 'packages'} of "${fgName}". Only ${availPkgStock} available in ${locName}.`
           });
         }
       } else {
-        // Loose finished goods stock validation
-        const looseStockRes = await req.tenantDb.query(
-          `SELECT COALESCE(SUM(
+        // Loose finished goods stock validation in the target warehouse
+        const looseStockQuery = `SELECT COALESCE(SUM(
              CASE WHEN transaction_type = 'in' THEN quantity
                   WHEN transaction_type = 'out' THEN -quantity
                   ELSE 0 END
            ), 0) AS avail_loose_stock
            FROM inventory_ledger
-           WHERE item_type = 'finished_good' AND item_id = ? AND packaging_level_id IS NULL`,
-          [fgId]
-        );
+           WHERE item_type = 'finished_good' AND item_id = ? AND packaging_level_id IS NULL
+           ${targetLocationId ? 'AND location_id = ?' : ''}`;
+        const looseStockParams = targetLocationId ? [fgId, targetLocationId] : [fgId];
+
+        const looseStockRes = await req.tenantDb.query(looseStockQuery, looseStockParams);
         const availLooseStock = Math.max(0, Number(looseStockRes.rows[0]?.avail_loose_stock || 0));
         const reqQty = Number(item.quantity) || 0;
         if (reqQty > availLooseStock) {
           return res.status(400).json({
-            error: `Cannot sell ${reqQty} ${fg?.unit || 'units'} loose of "${fgName}". Only ${availLooseStock} loose units available in stock.`
+            error: `Cannot sell ${reqQty} ${fg?.unit || 'units'} loose of "${fgName}". Only ${availLooseStock} loose units available in ${locName}.`
           });
         }
       }
@@ -657,12 +683,11 @@ router.post('/', requireAuth, requirePermission('sales', 'create'), async (req, 
       roundingTarget: 1
     });
 
-    const received = Math.max(0, Number(amount_received) || 0);
+    const received = Math.max(0, numeric(amount_received));
     const due = Math.max(0, totals.total_amount - received);
     const paymentStatus = due <= 0.01 ? 'Paid' : (received > 0 ? 'Partially Paid' : 'Unpaid');
 
     const invoiceNumber = await getNextDocumentNumber(req.tenantDb, 'invoice');
-    const targetLocationId = req.body.location_id || null;
     const initialStatus = send_to_customer ? 'Sales Order Sent' : 'Draft';
 
     await req.tenantDb.query('START TRANSACTION');
@@ -1029,7 +1054,7 @@ router.get('/:id/payments', requireAuth, async (req, res) => {
 // POST Record Payment Installment for Invoice
 router.post('/:id/payments', requireAuth, async (req, res) => {
   const { amount, date, notes } = req.body;
-  const amt = Number(amount);
+  const amt = numeric(amount);
   if (!amt || amt <= 0) return res.status(400).json({ error: 'Please enter a valid positive payment amount' });
 
   try {
