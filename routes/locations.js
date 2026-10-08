@@ -17,7 +17,7 @@ const { getInventorySnapshot } = require('../lib/analytics');
 router.get('/locations', requireAuth, requirePermission('locations', 'view'), async (req, res) => {
   try {
     let result = await req.tenantDb.query(
-      `SELECT id, name, address, city, state, is_default, status, notes, created_at, updated_at
+      `SELECT id, location_code, name, address, city, state, is_default, status, notes, created_at, updated_at
        FROM locations
        WHERE deleted_at IS NULL
        ORDER BY is_default DESC, name ASC`
@@ -48,17 +48,27 @@ router.get('/locations', requireAuth, requirePermission('locations', 'view'), as
 
       const defaultLocId = crypto.randomUUID();
       await req.tenantDb.query(
-        `INSERT INTO locations (id, name, address, city, state, is_default, status, notes)
-         VALUES (?, ?, ?, ?, ?, 1, 'Active', 'Primary main location auto-initialized from business setup')`,
+        `INSERT INTO locations (id, location_code, name, address, city, state, is_default, status, notes)
+         VALUES (?, 'LOC-0001', ?, ?, ?, ?, 1, 'Active', 'Primary main location auto-initialized from business setup')`,
         [defaultLocId, companyName, companyAddress, companyCity, companyState]
       );
 
       result = await req.tenantDb.query(
-        `SELECT id, name, address, city, state, is_default, status, notes, created_at, updated_at
+        `SELECT id, location_code, name, address, city, state, is_default, status, notes, created_at, updated_at
          FROM locations
          WHERE deleted_at IS NULL
          ORDER BY is_default DESC, name ASC`
       );
+    }
+
+    // Ensure every location has a location_code populated
+    for (let i = 0; i < result.rows.length; i++) {
+      const row = result.rows[i];
+      if (!row.location_code || !String(row.location_code).trim()) {
+        const generatedCode = row.is_default ? 'LOC-0001' : `LOC-${String(i + 1).padStart(4, '0')}`;
+        row.location_code = generatedCode;
+        req.tenantDb.query('UPDATE locations SET location_code = ? WHERE id = ?', [generatedCode, row.id]).catch(() => {});
+      }
     }
 
     return res.json(result.rows);

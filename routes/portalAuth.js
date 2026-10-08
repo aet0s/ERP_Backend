@@ -17,6 +17,7 @@ const { createNotification } = require('../lib/notifications');
 const { calculateInvoiceLine, calculateInvoiceTotals, getNextDocumentNumber } = require('../lib/invoiceEngine');
 const { publishReturnRequestMessage } = require('../lib/returnRequestSocket');
 const { getFrontendBaseUrl } = require('../lib/urlUtils');
+const { executeApproveReturnRequest } = require('../lib/returnsEngine');
 
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error('FATAL: JWT_SECRET environment variable is not configured');
@@ -2354,8 +2355,26 @@ router.post(['/returns/:id/accept', '/portal/returns/:id/accept'], requireUniver
     if (!['purchase_return', 'purchase_cancellation'].includes(returnRequest.request_type)) return res.status(400).json({ error: 'This is not a vendor return request' });
     if (returnRequest.status !== 'Pending') return res.status(409).json({ error: 'This return request has already been reviewed' });
 
-    await tenantDb.query(`UPDATE return_requests SET status = 'Approved', review_notes = ?, reviewed_at = NOW(), updated_at = NOW() WHERE id = ? AND status = 'Pending'`, [(notes || 'Accepted by vendor').trim(), returnRequest.id]);
-    await tenantDb.query("UPDATE procurements SET status = 'Return Accepted by Vendor', updated_at = NOW() WHERE id = ? AND vendor_id = ? AND deleted_at IS NULL", [returnRequest.reference_id, membership.entity_id]);
+    const client = await tenantDb.connect();
+    try {
+      await client.query('START TRANSACTION');
+      await executeApproveReturnRequest(
+        client,
+        returnRequest.id,
+        req.portalUser.id,
+        (notes || 'Accepted by vendor').trim()
+      );
+      await client.query(
+        "UPDATE procurements SET status = 'Return Accepted by Vendor', updated_at = NOW() WHERE id = ? AND vendor_id = ? AND deleted_at IS NULL",
+        [returnRequest.reference_id, membership.entity_id]
+      );
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
 
     // Auto-close chat
     await insertSystemMessage(
@@ -2363,7 +2382,7 @@ router.post(['/returns/:id/accept', '/portal/returns/:id/accept'], requireUniver
       `✅ Vendor has Approved this return request. ${notes ? `Notes: ${notes.trim()}` : ''} The chat is now closed and contact information is available.`
     );
 
-    return res.json({ ok: true, message: 'Return request accepted', status: 'Approved', procurement_status: 'Return Accepted by Vendor' });
+    return res.json({ ok: true, message: 'Return request accepted and inventory updated', status: 'Approved', procurement_status: 'Return Accepted by Vendor' });
   } catch (err) {
     console.error('vendor portal return acceptance error:', err);
     return res.status(500).json({ error: 'Failed to accept return request' });

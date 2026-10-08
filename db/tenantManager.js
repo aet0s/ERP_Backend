@@ -141,6 +141,13 @@ function getOrCreateTenantPoolSync(dbName) {
   const config = parseTenantConfig(dbName);
   const mysqlPool = mysql.createPool(config);
 
+  if (mysqlPool.pool && typeof mysqlPool.pool.on === 'function') {
+    mysqlPool.pool.on('connection', (conn) => {
+      conn.query('SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED');
+      conn.query('SET autocommit = 1');
+    });
+  }
+
   const entry = {
     dbName,
     pool: mysqlPool,
@@ -153,9 +160,86 @@ function getOrCreateTenantPoolSync(dbName) {
 }
 
 function wrapTenantPool(entry) {
+  let txConn = null;
+  let txTimer = null;
+  const txIdleTimeoutMs = parseInt(process.env.TENANT_TX_IDLE_TIMEOUT_MS || '120000', 10);
+
+  const clearTxWatchdog = () => {
+    if (txTimer) {
+      clearTimeout(txTimer);
+      txTimer = null;
+    }
+  };
+
+  const resetTxWatchdog = () => {
+    clearTxWatchdog();
+    if (txConn) {
+      txTimer = setTimeout(async () => {
+        console.warn(`[tenantManager] Abandoned transaction timed out (${txIdleTimeoutMs}ms) on ${entry.dbName}, rolling back`);
+        if (txConn) {
+          const connToRelease = txConn;
+          txConn = null;
+          try {
+            await connToRelease.query('ROLLBACK');
+          } catch (_) {}
+          try {
+            connToRelease.release();
+          } catch (_) {}
+          entry.activeQueries = Math.max(0, entry.activeQueries - 1);
+          processQueue();
+        }
+      }, txIdleTimeoutMs);
+    }
+  };
+
   return {
     databaseName: entry.dbName,
     query: async (sql, params) => {
+      const sqlTrim = typeof sql === 'string' ? sql.trim() : '';
+
+      // Check if query is starting a transaction
+      if (/^\s*(START TRANSACTION|BEGIN)\b/i.test(sqlTrim)) {
+        if (!txConn) {
+          entry.lastUsed = Date.now();
+          entry.activeQueries++;
+          txConn = await entry.pool.getConnection();
+        }
+        resetTxWatchdog();
+        const res = await txConn.query(sql, params);
+        return fmt(res);
+      }
+
+      // Check if query is committing or rolling back
+      if (/^\s*(COMMIT|ROLLBACK)\b/i.test(sqlTrim)) {
+        if (!txConn) {
+          // No open transaction on this wrapper: safe no-op
+          return { rows: [], rowCount: 0, insertId: null, affectedRows: 0 };
+        }
+        clearTxWatchdog();
+        const connToRelease = txConn;
+        txConn = null;
+        try {
+          const res = await connToRelease.query(sql, params);
+          return fmt(res);
+        } finally {
+          try {
+            connToRelease.release();
+          } catch (_) {}
+          entry.activeQueries = Math.max(0, entry.activeQueries - 1);
+          entry.lastUsed = Date.now();
+          processQueue();
+        }
+      }
+
+      // If already inside an open transaction on this wrapper, execute on txConn
+      if (txConn) {
+        resetTxWatchdog();
+        entry.lastUsed = Date.now();
+        const res = await txConn.query(sql, params);
+        return fmt(res);
+      }
+
+      // Normal non-transactional query on pool
       entry.lastUsed = Date.now();
       entry.activeQueries++;
       try {
@@ -198,6 +282,16 @@ function wrapTenantPool(entry) {
       };
     },
     end: async () => {
+      clearTxWatchdog();
+      if (txConn) {
+        try {
+          await txConn.query('ROLLBACK');
+        } catch (_) {}
+        try {
+          txConn.release();
+        } catch (_) {}
+        txConn = null;
+      }
       await closeTenantPool(entry.dbName);
     }
   };
@@ -221,13 +315,20 @@ function getTenantPool(dbName) {
   }
 
   // Otherwise, synchronously return a proxy wrapper that queues connection acquiring when invoked
+  let cachedWrapper = null;
+  const getWrapper = async () => {
+    if (!cachedWrapper) cachedWrapper = await waitForPoolSlot(dbName);
+    return cachedWrapper;
+  };
+
   return {
+    databaseName: dbName,
     query: async (sql, params) => {
-      const poolObj = await waitForPoolSlot(dbName);
+      const poolObj = await getWrapper();
       return poolObj.query(sql, params);
     },
     connect: async () => {
-      const poolObj = await waitForPoolSlot(dbName);
+      const poolObj = await getWrapper();
       return poolObj.connect();
     },
     end: async () => {

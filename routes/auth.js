@@ -11,31 +11,15 @@ const { getTenantPool } = require('../db/tenantManager');
 const { provisionTenant, cleanupFailedRegistration } = require('../db/provisionTenant');
 const { requireAuth } = require('../middleware/auth');
 const { logTenantAudit, logMasterAudit } = require('../lib/auditCrypto');
+const { parseRoles, resolveUserRoles } = require('../lib/roles');
+const { ensureDefaultRolePermissions } = require('../lib/defaultPermissions');
 
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error('FATAL: JWT_SECRET environment variable is not configured');
 const BCRYPT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || '12', 10);
 
-function parseRoles(rawRoles, fallbackRole = 'accounts') {
-  if (Array.isArray(rawRoles)) {
-    return rawRoles.map((r) => String(r).trim()).filter(Boolean);
-  }
-  if (!rawRoles) return fallbackRole ? [fallbackRole] : ['staff'];
-  if (typeof rawRoles === 'string') {
-    const trimmed = rawRoles.trim();
-    if (trimmed.startsWith('[')) {
-      try {
-        const parsed = JSON.parse(trimmed);
-        if (Array.isArray(parsed)) return parsed.map((r) => String(r).trim()).filter(Boolean);
-      } catch {}
-    }
-    return trimmed.split(',').map((r) => r.trim()).filter(Boolean);
-  }
-  return fallbackRole ? [fallbackRole] : ['staff'];
-}
-
 function issueAccessToken(user, companyId) {
-  const userRoles = parseRoles(user.roles, user.role);
+  const userRoles = resolveUserRoles(user.role, user.roles);
 
   return jwt.sign(
     {
@@ -328,8 +312,9 @@ router.post('/login', async (req, res) => {
     user.workspace_id = companyId;
     user.company_id = companyId;
 
-    const userRoles = parseRoles(user.roles, user.role || 'accounts');
+    const userRoles = resolveUserRoles(user.role, user.roles);
     user.roles = userRoles;
+    user.role = userRoles[0] || user.role || 'accounts';
 
     const token = issueAccessToken(user, companyId);
     const refreshToken = buildRefreshToken();
@@ -371,6 +356,7 @@ router.post('/login', async (req, res) => {
     }).catch((err) => console.warn('Master login audit write error:', err.message));
 
     // Fetch live role_permissions aggregated across all assigned roles
+    await ensureDefaultRolePermissions(tenantPool);
     const placeholders = userRoles.map(() => '?').join(',');
     const permRes = await tenantPool.query(
       `SELECT module, MAX(can_view) AS can_view, MAX(can_create) AS can_create, MAX(can_edit) AS can_edit, MAX(can_delete) AS can_delete, MAX(can_approve) AS can_approve, MAX(can_export) AS can_export
@@ -412,10 +398,12 @@ router.get('/me', requireAuth, async (req, res) => {
     user.workspace_id = req.user.company_id;
     user.company_id = req.user.company_id;
 
-    const userRoles = parseRoles(user.roles, user.role || req.user.role || 'accounts');
+    const userRoles = resolveUserRoles(user.role, user.roles);
     user.roles = userRoles;
+    user.role = userRoles[0] || user.role || 'accounts';
 
     // Fetch live role_permissions aggregated across all assigned roles
+    await ensureDefaultRolePermissions(req.tenantDb);
     const placeholders = userRoles.map(() => '?').join(',');
     const permRes = await req.tenantDb.query(
       `SELECT module, MAX(can_view) AS can_view, MAX(can_create) AS can_create, MAX(can_edit) AS can_edit, MAX(can_delete) AS can_delete, MAX(can_approve) AS can_approve, MAX(can_export) AS can_export
@@ -502,12 +490,14 @@ router.put('/profile', requireAuth, async (req, res) => {
       [userId]
     );
     const updatedUser = updatedUserRes.rows[0];
-    const userRoles = parseRoles(updatedUser.roles, updatedUser.role || req.user.role || 'accounts');
+    const userRoles = resolveUserRoles(updatedUser.role, updatedUser.roles);
     updatedUser.roles = userRoles;
+    updatedUser.role = userRoles[0] || updatedUser.role || 'accounts';
     updatedUser.workspace_id = req.user.company_id;
     updatedUser.company_id = req.user.company_id;
 
     // Fetch live permissions
+    await ensureDefaultRolePermissions(req.tenantDb);
     const placeholders = userRoles.map(() => '?').join(',');
     const permRes = await req.tenantDb.query(
       `SELECT module, MAX(can_view) AS can_view, MAX(can_create) AS can_create, MAX(can_edit) AS can_edit, MAX(can_delete) AS can_delete, MAX(can_approve) AS can_approve, MAX(can_export) AS can_export
@@ -561,8 +551,9 @@ router.post('/refresh', async (req, res) => {
 
     if (userRes.rowCount === 0) return res.status(401).json({ error: 'User not found' });
     const user = userRes.rows[0];
-    const userRoles = parseRoles(user.roles, user.role || 'accounts');
+    const userRoles = resolveUserRoles(user.role, user.roles);
     user.roles = userRoles;
+    user.role = userRoles[0] || user.role || 'accounts';
 
     // Revoke used token
     await queryMaster('DELETE FROM master_refresh_tokens WHERE id = ?', [record.id]);
@@ -609,5 +600,6 @@ router.buildRefreshToken = buildRefreshToken;
 router.persistRefreshToken = persistRefreshToken;
 router.setAuthCookies = setAuthCookies;
 router.parseRoles = parseRoles;
+router.resolveUserRoles = resolveUserRoles;
 
 module.exports = router;

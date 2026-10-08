@@ -3,26 +3,41 @@
 const jwt = require('jsonwebtoken');
 const { queryMaster } = require('../db/masterDb');
 const { getTenantPool } = require('../db/tenantManager');
+const { parseRoles, resolveUserRoles } = require('../lib/roles');
+const { ensureDefaultRolePermissions } = require('../lib/defaultPermissions');
 
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error('FATAL: JWT_SECRET environment variable is not configured');
 
-function parseRoles(rawRoles, fallbackRole = 'accounts') {
-  if (Array.isArray(rawRoles)) {
-    return rawRoles.map((r) => String(r).trim()).filter(Boolean);
-  }
-  if (!rawRoles) return fallbackRole ? [fallbackRole] : ['staff'];
-  if (typeof rawRoles === 'string') {
-    const trimmed = rawRoles.trim();
-    if (trimmed.startsWith('[')) {
-      try {
-        const parsed = JSON.parse(trimmed);
-        if (Array.isArray(parsed)) return parsed.map((r) => String(r).trim()).filter(Boolean);
-      } catch {}
+const ensuredAuthColumnsTenants = new Set();
+
+async function guaranteeAuthColumns(tenantDb, dbName) {
+  if (!tenantDb || !dbName) return;
+  if (ensuredAuthColumnsTenants.has(dbName)) return;
+
+  try {
+    const res = await tenantDb.query(
+      `SELECT COLUMN_NAME
+       FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'users' AND COLUMN_NAME IN ('roles', 'vendor_id', 'customer_id')`,
+      [dbName]
+    );
+    const existing = (res.rows || []).map((r) => r.COLUMN_NAME || r.column_name);
+
+    if (!existing.includes('roles')) {
+      await tenantDb.query('ALTER TABLE users ADD COLUMN roles TEXT NULL').catch(() => {});
     }
-    return trimmed.split(',').map((r) => r.trim()).filter(Boolean);
+    if (!existing.includes('vendor_id')) {
+      await tenantDb.query('ALTER TABLE users ADD COLUMN vendor_id VARCHAR(36) NULL').catch(() => {});
+    }
+    if (!existing.includes('customer_id')) {
+      await tenantDb.query('ALTER TABLE users ADD COLUMN customer_id VARCHAR(36) NULL').catch(() => {});
+    }
+
+    ensuredAuthColumnsTenants.add(dbName);
+  } catch (err) {
+    console.error('guaranteeAuthColumns error on', dbName, err);
   }
-  return fallbackRole ? [fallbackRole] : ['staff'];
 }
 
 function cookieToken(req) {
@@ -102,48 +117,51 @@ async function requireAuth(req, res, next) {
 
     const tenantDb = getTenantPool(company.database_name);
     const userId = payload.userId || payload.user_id || payload.id;
-
-    // Fetch live user record to enforce dynamic role updates and active status immediately
-    let liveRole = payload.role;
-    let liveRoles = payload.roles;
-    let liveName = payload.name;
-    let liveEmail = payload.email;
-    let liveVendorId = payload.vendor_id || null;
-    let liveCustomerId = payload.customer_id || null;
-
-    if (userId) {
-      try {
-        const uRes = await tenantDb.query(
-          'SELECT id, name, email, role, roles, status, vendor_id, customer_id FROM users WHERE id = ? AND deleted_at IS NULL',
-          [userId]
-        );
-        if (uRes.rows && uRes.rows.length > 0) {
-          const row = uRes.rows[0];
-          if (row.status === 'inactive' || row.status === 'suspended') {
-            return res.status(403).json({ error: 'Account is deactivated or suspended' });
-          }
-          liveRole = row.role || liveRole;
-          liveRoles = row.roles || liveRoles;
-          liveName = row.name || liveName;
-          liveEmail = row.email || liveEmail;
-          liveVendorId = row.vendor_id !== undefined ? row.vendor_id : liveVendorId;
-          liveCustomerId = row.customer_id !== undefined ? row.customer_id : liveCustomerId;
-        }
-      } catch (dbErr) {
-        // Fall back to token values if query fails
-      }
+    if (!userId) {
+      return res.status(401).json({ error: 'Invalid token payload: missing user_id' });
     }
 
-    const userRoles = parseRoles(liveRoles, liveRole || 'accounts');
+    // Guarantee users.roles, users.vendor_id, users.customer_id exist
+    await guaranteeAuthColumns(tenantDb, company.database_name);
+
+    // Fetch live user record to enforce dynamic role updates and active status immediately
+    let uRes;
+    try {
+      uRes = await tenantDb.query(
+        'SELECT id, name, email, role, roles, status, vendor_id, customer_id, deleted_at FROM users WHERE id = ?',
+        [userId]
+      );
+    } catch (dbErr) {
+      console.error('requireAuth database error:', dbErr);
+      return res.status(503).json({ error: 'Service temporarily unavailable' });
+    }
+
+    if (!uRes.rows || uRes.rows.length === 0) {
+      return res.status(401).json({ error: 'User account not found' });
+    }
+
+    const row = uRes.rows[0];
+
+    // Check deleted
+    if (row.deleted_at || row.status === 'deleted') {
+      return res.status(401).json({ error: 'User account not found or has been deleted' });
+    }
+
+    // Check inactive / suspended
+    if (row.status === 'inactive' || row.status === 'suspended') {
+      return res.status(403).json({ error: 'Account is deactivated or suspended' });
+    }
+
+    const userRoles = resolveUserRoles(row.role, row.roles);
 
     req.user = {
-      id: userId,
-      name: liveName,
-      email: liveEmail,
-      role: liveRole || userRoles[0] || 'accounts',
-      roles: userRoles.length > 0 ? userRoles : [liveRole || 'accounts'],
-      vendor_id: liveVendorId,
-      customer_id: liveCustomerId,
+      id: row.id,
+      name: row.name,
+      email: row.email,
+      role: userRoles[0] || row.role || 'accounts',
+      roles: userRoles,
+      vendor_id: row.vendor_id !== undefined ? row.vendor_id : null,
+      customer_id: row.customer_id !== undefined ? row.customer_id : null,
       workspace_id: companyId,
       company_id: companyId
     };
@@ -188,6 +206,7 @@ function requirePermission(moduleName, action = 'view') {
 
     const col = `can_${action}`;
     try {
+      await ensureDefaultRolePermissions(req.tenantDb);
       const placeholders = userRoles.map(() => '?').join(',');
       const permRes = await req.tenantDb.query(
         `SELECT MAX(${col}) AS allowed FROM role_permissions WHERE role IN (${placeholders}) AND module = ?`,
@@ -258,5 +277,6 @@ module.exports = {
   requireRole,
   requirePermission,
   requirePlatformAdminAuth,
-  getPlatformAdminToken
+  getPlatformAdminToken,
+  parseRoles
 };

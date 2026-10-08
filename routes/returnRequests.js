@@ -466,8 +466,8 @@ router.post('/return-requests/:id/approve', requireAuth, requirePermission('retu
     const rr = rrRes.rows[0];
 
     const approvalResult = await executeApproveReturnRequest(client, req.params.id, userId, review_notes);
-    outcomeDocType = approvalResult.outcome_document_type;
-    outcomeDocId = approvalResult.outcome_document_id;
+    const outcomeDocType = approvalResult.outcome_document_type;
+    const outcomeDocId = approvalResult.outcome_document_id;
 
     if (rr.customer_id) {
       await createNotification(client, {

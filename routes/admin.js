@@ -11,6 +11,8 @@ const { dumpTenantDatabase, dumpMasterDatabase, restoreTenantDatabase } = requir
 const { requirePlatformAdminAuth } = require('../middleware/auth');
 const { logMasterAudit, verifyMasterAuditChain } = require('../lib/auditCrypto');
 const { ensureDefaultRolePermissions } = require('../lib/defaultPermissions');
+const { applyPermissionMatrix, MATRIX_SQL } = require('./permissions');
+const { normaliseAssignment, ASSIGNABLE_ROLES, PORTAL_ROLES } = require('../lib/roles');
 
 const BCRYPT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || '12', 10);
 
@@ -656,13 +658,22 @@ router.post('/users', async (req, res) => {
 // Update user role (supports both /users/:id/role and /users/:id/roles)
 router.put(['/users/:id/role', '/users/:id/roles'], async (req, res) => {
   const { role, roles } = req.body;
-  const assignedRoles = Array.isArray(roles) && roles.length > 0 ? roles : (role ? [role] : ['staff']);
-  const primaryRole = assignedRoles[0] || 'staff';
-  const rolesString = assignedRoles.join(',');
+  const { primaryRole, assignedRoles, rolesString } = normaliseAssignment(role, roles);
+
+  // Validate roles against allowed roles
+  const ALLOWED_ADMIN_ROLES = [...ASSIGNABLE_ROLES, ...PORTAL_ROLES];
+  for (const r of assignedRoles) {
+    if (!ALLOWED_ADMIN_ROLES.includes(r)) {
+      return res.status(400).json({ error: `Unknown role: '${r}'` });
+    }
+  }
 
   try {
-    // Find which workspace this user belongs to
-    const masterRes = await queryMaster('SELECT company_id, user_id, email FROM company_users WHERE user_id = ?', [req.params.id]);
+    // Find which workspace this user belongs to (only where status != 'deleted')
+    const masterRes = await queryMaster(
+      "SELECT company_id, user_id, email FROM company_users WHERE user_id = ? AND status != 'deleted'",
+      [req.params.id]
+    );
     if (masterRes.rowCount === 0) return res.status(404).json({ error: 'User not found in master registry' });
 
     const { company_id, user_id, email } = masterRes.rows[0];
@@ -673,8 +684,23 @@ router.put(['/users/:id/role', '/users/:id/roles'], async (req, res) => {
     await tenantPool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS roles TEXT NULL').catch(() => {});
     await queryMaster('ALTER TABLE company_users ADD COLUMN IF NOT EXISTS roles TEXT NULL').catch(() => {});
 
-    await tenantPool.query('UPDATE users SET role = ?, roles = ? WHERE id = ?', [primaryRole, rolesString, user_id]);
-    await queryMaster('UPDATE company_users SET role = ?, roles = ? WHERE user_id = ?', [primaryRole, rolesString, user_id]);
+    // Update users with AND deleted_at IS NULL and return 404 if affectedRows is 0
+    const uRes = await tenantPool.query(
+      'UPDATE users SET role = ?, roles = ? WHERE id = ? AND deleted_at IS NULL',
+      [primaryRole, rolesString, user_id]
+    );
+    if (!uRes.affectedRows || uRes.affectedRows === 0) {
+      return res.status(404).json({ error: 'User not found or deleted in workspace' });
+    }
+
+    // Update company_users with AND company_id = ?
+    await queryMaster(
+      'UPDATE company_users SET role = ?, roles = ? WHERE user_id = ? AND company_id = ?',
+      [primaryRole, rolesString, user_id, company_id]
+    );
+
+    // Ensure default permissions are in place
+    await ensureDefaultRolePermissions(tenantPool);
 
     await logMasterAudit(queryMaster, {
       company_id,
@@ -2280,7 +2306,7 @@ router.get('/workspaces/:id/permissions', async (req, res) => {
     if (compRes.rowCount === 0) return res.status(404).json({ error: 'Workspace not found' });
     const tenantPool = getTenantPool(compRes.rows[0].database_name);
     await ensureDefaultRolePermissions(tenantPool);
-    const result = await tenantPool.query("SELECT role, module, can_view, can_create, can_edit, can_delete, can_approve, can_export FROM role_permissions WHERE role NOT IN ('vendor', 'customer') ORDER BY role, module");
+    const result = await tenantPool.query(MATRIX_SQL);
     return res.json(result.rows || []);
   } catch (err) {
     console.error('admin get workspace permissions error', err);
@@ -2295,33 +2321,26 @@ router.put('/workspaces/:id/permissions', async (req, res) => {
   }
 
   try {
-    const compRes = await queryMaster('SELECT database_name FROM companies WHERE id = ?', [req.params.id]);
+    const compRes = await queryMaster('SELECT id, company_name, database_name FROM companies WHERE id = ?', [req.params.id]);
     if (compRes.rowCount === 0) return res.status(404).json({ error: 'Workspace not found' });
-    const tenantPool = getTenantPool(compRes.rows[0].database_name);
+    const comp = compRes.rows[0];
+    const tenantPool = getTenantPool(comp.database_name);
 
-    await tenantPool.query('START TRANSACTION');
-    for (const p of permissions) {
-      if (p.role === 'vendor' || p.role === 'customer') continue;
-      await tenantPool.query(`
-        INSERT INTO role_permissions (id, role, module, can_view, can_create, can_edit, can_delete, can_approve, can_export)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON DUPLICATE KEY UPDATE
-          can_view = VALUES(can_view),
-          can_create = VALUES(can_create),
-          can_edit = VALUES(can_edit),
-          can_delete = VALUES(can_delete),
-          can_approve = VALUES(can_approve),
-          can_export = VALUES(can_export)
-      `, [
-        `${p.role}_${p.module}`, p.role, p.module,
-        p.can_view ? 1 : 0, p.can_create ? 1 : 0,
-        p.can_edit ? 1 : 0, p.can_delete ? 1 : 0,
-        p.can_approve ? 1 : 0, p.can_export ? 1 : 0
-      ]);
-    }
-    await tenantPool.query('COMMIT');
-    return res.json({ ok: true, message: 'Workspace internal permissions updated successfully' });
+    const result = await applyPermissionMatrix(tenantPool, permissions);
+
+    const adminActor = req.platformAdmin?.email || 'super_admin';
+    await logMasterAudit(queryMaster, {
+      company_id: comp.id,
+      user_id: adminActor,
+      action: 'superadmin_update_workspace_permissions',
+      metadata: { count: permissions.length, workspace_name: comp.company_name, by: adminActor }
+    }).catch(() => {});
+
+    return res.json(result);
   } catch (err) {
+    if (err.status === 400 || err.statusCode === 400) {
+      return res.status(400).json({ error: err.message });
+    }
     console.error('admin update workspace permissions error', err);
     return res.status(500).json({ error: 'Failed to update workspace permissions' });
   }
