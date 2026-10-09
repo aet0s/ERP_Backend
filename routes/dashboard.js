@@ -501,7 +501,7 @@ async function dashboardOverview(req) {
   };
 }
 
-router.get('/overview', requireAuth, requirePermission('dashboard', 'view'), async (req, res) => {
+router.get(['/', '/overview', '/stats'], requireAuth, requirePermission('dashboard', 'view'), async (req, res) => {
   try {
     const data = await dashboardOverview(req);
     return res.json(data);
