@@ -229,7 +229,7 @@ router.get('/procurements', requireAuth, requirePermission('procurement', 'view'
 });
 
 // Single Procurement Details
-router.get('/procurements/:id', requireAuth, async (req, res) => {
+router.get('/procurements/:id', requireAuth, requirePermission('procurement', 'view'), async (req, res) => {
   try {
     const result = await req.tenantDb.query(
       `SELECT p.*, 
@@ -971,7 +971,7 @@ router.post('/procurements/:id/payments', requireAuth, requirePermission('procur
 });
 
 // Purchase Orders & Debit Notes Endpoints
-router.get('/purchase-orders', requireAuth, async (req, res) => {
+router.get('/purchase-orders', requireAuth, requirePermission('procurement', 'view'), async (req, res) => {
   try {
     const isTable = req.query.table === '1';
     const page = Math.max(parseInt(req.query.page || '1', 10), 1);
@@ -1150,7 +1150,7 @@ router.delete('/purchase-orders/:id', requireAuth, requirePermission('procuremen
   }
 });
 
-router.get('/debit-notes', requireAuth, async (req, res) => {
+router.get('/debit-notes', requireAuth, requirePermission('procurement', 'view'), async (req, res) => {
   try {
     const isTable = req.query.table === '1';
     const page = Math.max(parseInt(req.query.page || '1', 10), 1);

@@ -436,7 +436,7 @@ router.get('/stock-transfers', requireAuth, requirePermission('stock_transfers',
 });
 
 // Fetch available items for stock transfer by item_type and optional location_id
-router.get('/stock-transfers/available-items', requireAuth, async (req, res) => {
+router.get('/stock-transfers/available-items', requireAuth, requirePermission('stock_transfers', 'view'), async (req, res) => {
   try {
     const { item_type = 'raw_material', location_id } = req.query;
     let items = [];

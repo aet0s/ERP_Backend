@@ -318,34 +318,29 @@ async function syncTenantPortalUser(tenantDb, portalType, globalUser, entityId, 
   const entityColumn = portalType === 'vendor' ? 'vendor_id' : 'customer_id';
 
   const existingRes = await tenantDb.query(
-    `SELECT * FROM ${tableName} WHERE email = ? AND ${entityColumn} = ?`,
-    [globalUser.email, entityId]
+    `SELECT * FROM ${tableName} WHERE email = ?`,
+    [globalUser.email]
   );
 
   let localUserId;
   if (existingRes.rowCount > 0) {
     localUserId = existingRes.rows[0].id;
-    if (globalUser.password_hash && existingRes.rows[0].password_hash !== globalUser.password_hash) {
-      await tenantDb.query(
-        `UPDATE ${tableName} SET password_hash = ?, name = ?, status = 'Active' WHERE id = ?`,
-        [globalUser.password_hash, globalUser.name, localUserId]
-      );
-    }
+    await tenantDb.query(
+      `UPDATE ${tableName} 
+       SET ${entityColumn} = ?,
+           password_hash = COALESCE(?, password_hash),
+           name = COALESCE(?, name),
+           status = 'Active'
+       WHERE id = ?`,
+      [entityId, globalUser.password_hash || null, globalUser.name || null, localUserId]
+    );
   } else {
     localUserId = crypto.randomUUID();
     await tenantDb.query(
       `INSERT INTO ${tableName} (id, ${entityColumn}, name, email, password_hash, status)
        VALUES (?, ?, ?, ?, ?, 'Active')`,
-      [localUserId, entityId, globalUser.name, globalUser.email, globalUser.password_hash]
+      [localUserId, entityId, globalUser.name || 'Portal User', globalUser.email, globalUser.password_hash || null]
     );
-  }
-
-  if (globalUser.password_hash || globalUser.last_login_at) {
-    const parentTable = portalType === 'vendor' ? 'vendors' : 'customers';
-    await tenantDb.query(
-      `UPDATE ${parentTable} SET connection_status = 'connected' WHERE id = ?`,
-      [entityId]
-    ).catch(() => {});
   }
 
   return localUserId;
@@ -621,6 +616,7 @@ router.get(['/connections', '/portal/connections', '/me', '/portal/me'], require
         gpm.entity_id,
         gpm.portal_type,
         gpm.status AS membership_status,
+        gpm.invite_expires_at,
         gpm.created_at AS requested_at,
         gpm.joined_at,
         c.company_name,
@@ -639,7 +635,12 @@ router.get(['/connections', '/portal/connections', '/me', '/portal/me'], require
     );
 
     const activeConnections = membershipsRes.rows.filter((m) => m.membership_status === 'Active');
-    const pendingRequests = membershipsRes.rows.filter((m) => m.membership_status === 'Pending');
+    const pendingRequests = membershipsRes.rows
+      .filter((m) => m.membership_status === 'Pending')
+      .map((m) => ({
+        ...m,
+        is_expired: !!(m.invite_expires_at && new Date(m.invite_expires_at).getTime() <= Date.now())
+      }));
 
     const enrichedUser = await enrichPortalUserFromEntity(globalUser);
 
@@ -689,29 +690,41 @@ router.post(['/connections/:membership_id/accept', '/portal/connections/:members
     }
 
     const membership = memRes.rows[0];
-    if (membership.status === 'Active') {
-      return res.json({ ok: true, message: 'Already connected to ' + membership.company_name });
+
+    // Accept only works on a membership whose status is Pending and not expired
+    if (membership.status !== 'Pending') {
+      return res.status(400).json({ error: `Cannot accept connection request with status: ${membership.status}` });
     }
 
-    // Activate membership in master DB
-    await queryMaster(
-      'UPDATE global_portal_memberships SET status = \'Active\', joined_at = NOW() WHERE id = ?',
-      [membership_id]
-    );
+    if (membership.invite_expires_at && new Date(membership.invite_expires_at) <= new Date()) {
+      return res.status(400).json({ error: 'Connection invitation has expired. Please ask the workspace to re-invite you.' });
+    }
 
-    // Sync in tenant DB
+    // Order of operations:
+    // 1. Resolve tenant DB from membership.database_name (NOT the caller's workspace)
     const tenantDb = getTenantPool(membership.database_name);
+
+    // 2. Run syncTenantPortalUser first (idempotent upsert)
+    await syncTenantPortalUser(tenantDb, membership.portal_type, globalUser, membership.entity_id, membership.company_id);
+
+    // 3. Set local connection_status = 'connected' in tenant DB
     if (membership.portal_type === 'vendor') {
       await tenantDb.query(
-        'UPDATE vendors SET connection_status = \'connected\' WHERE id = ?',
+        "UPDATE vendors SET connection_status = 'connected' WHERE id = ?",
         [membership.entity_id]
-      ).catch(() => {});
+      );
     } else if (membership.portal_type === 'customer') {
       await tenantDb.query(
-        'UPDATE customers SET connection_status = \'connected\' WHERE id = ?',
+        "UPDATE customers SET connection_status = 'connected' WHERE id = ?",
         [membership.entity_id]
-      ).catch(() => {});
+      );
     }
+
+    // 4. Set membership Active ONLY after tenant writes succeed
+    await queryMaster(
+      "UPDATE global_portal_memberships SET status = 'Active', joined_at = NOW(), invite_token = NULL, invite_expires_at = NULL WHERE id = ?",
+      [membership_id]
+    );
 
     return res.json({
       ok: true,
@@ -745,20 +758,20 @@ router.post(['/connections/:membership_id/decline', '/portal/connections/:member
 
     // Remove or decline in master DB
     await queryMaster(
-      'UPDATE global_portal_memberships SET status = \'Declined\' WHERE id = ?',
+      "UPDATE global_portal_memberships SET status = 'Declined' WHERE id = ?",
       [membership_id]
     );
 
-    // Update in tenant DB
+    // Update in tenant DB without deleting any mapping row
     const tenantDb = getTenantPool(membership.database_name);
     if (membership.portal_type === 'vendor') {
       await tenantDb.query(
-        'UPDATE vendors SET connection_status = \'declined\' WHERE id = ?',
+        "UPDATE vendors SET connection_status = 'declined' WHERE id = ?",
         [membership.entity_id]
       ).catch(() => {});
     } else if (membership.portal_type === 'customer') {
       await tenantDb.query(
-        'UPDATE customers SET connection_status = \'declined\' WHERE id = ?',
+        "UPDATE customers SET connection_status = 'declined' WHERE id = ?",
         [membership.entity_id]
       ).catch(() => {});
     }
@@ -2772,80 +2785,54 @@ router.post('/vendors/:id/portal-invite', requireAuth, requirePermission('partie
     const vendorPhone = vendor.phone || vendor.contact || phone || null;
     const vendorContactPerson = vendor.contact_person_name || name || vendor.name;
 
-    // 1. Check or create/update global portal user with all vendor details entered by ERP admin
-    let globalUser = await createOrUpdateGlobalPortalUser({
-      email: normalizedEmail,
-      name: vendorContactPerson,
-      phone: vendorPhone,
-      company_name: vendor.name,
-      gstin: vendor.gstin || null,
-      pan: vendor.pan || (vendor.gstin && vendor.gstin.length === 15 ? vendor.gstin.slice(2, 12) : null),
-      address: vendorAddress,
-      city: vendor.city || null,
-      state: vendor.state || null,
-      pincode: vendor.pincode || null,
-      business_type: 'Vendor / Supplier'
-    });
+    // 1. Check or create global portal user with vendor details entered by ERP admin
+    let globalUser = await getGlobalPortalUserByEmail(normalizedEmail);
+    if (!globalUser) {
+      globalUser = await createOrUpdateGlobalPortalUser({
+        email: normalizedEmail,
+        name: vendorContactPerson,
+        phone: vendorPhone,
+        company_name: vendor.name,
+        gstin: vendor.gstin || null,
+        pan: vendor.pan || (vendor.gstin && vendor.gstin.length === 15 ? vendor.gstin.slice(2, 12) : null),
+        address: vendorAddress,
+        city: vendor.city || null,
+        state: vendor.state || null,
+        pincode: vendor.pincode || null,
+        business_type: 'Vendor / Supplier'
+      });
+    }
 
     // 2. Check if membership already exists for this company
-    const existingMembership = await queryMaster(
+    const memRes = await queryMaster(
       'SELECT * FROM global_portal_memberships WHERE global_user_id = ? AND company_id = ? AND portal_type = ?',
       [globalUser.id, companyId, 'vendor']
     );
+    const existingMembership = memRes.rowCount > 0 ? memRes.rows[0] : null;
 
     const base = getFrontendBaseUrl(req);
-
     const forceReinvite = Boolean(req.body.force_reinvite || req.body.reset_password);
 
-    // If already member and active
-    if (!forceReinvite && existingMembership.rowCount > 0 && existingMembership.rows[0].status === 'Active') {
-      const inviteLink = `${base}/login?portal=partner&company=${companyId}`;
-      return res.status(200).json({
-        ok: true,
-        already_registered: true,
-        can_reinvite: true,
-        message: 'This vendor is already connected to your portal.',
-        invite_link: inviteLink
+    // If membership exists and is Active
+    if (!forceReinvite && existingMembership && existingMembership.status === 'Active') {
+      return res.status(400).json({
+        error: 'This vendor is already connected to your portal.'
       });
     }
 
-    // 3. If global user already has a password set from another company or previous signup
-    if (!forceReinvite && globalUser.password_hash) {
-      const membershipId = existingMembership.rowCount > 0 ? existingMembership.rows[0].id : crypto.randomUUID();
-      if (existingMembership.rowCount > 0) {
-        await queryMaster(
-          'UPDATE global_portal_memberships SET entity_id = ?, status = ?, joined_at = NOW() WHERE id = ?',
-          [vendorId, 'Active', membershipId]
-        );
-      } else {
-        await queryMaster(
-          `INSERT INTO global_portal_memberships (id, global_user_id, company_id, entity_id, portal_type, status, joined_at)
-           VALUES (?, ?, ?, ?, 'vendor', 'Active', NOW())`,
-          [membershipId, globalUser.id, companyId, vendorId]
-        );
-      }
-
-      await syncTenantPortalUser(req.tenantDb, 'vendor', globalUser, vendorId, companyId);
-      await req.tenantDb.query("UPDATE vendors SET connection_status = 'connected' WHERE id = ?", [vendorId]).catch(() => {});
-      const inviteLink = `${base}/login?portal=partner&company=${companyId}`;
-
-      return res.status(201).json({
-        ok: true,
-        already_registered: true,
-        can_reinvite: true,
-        portal_user_id: globalUser.id,
-        email: normalizedEmail,
-        invite_link: inviteLink,
-        message: 'Vendor already has an active account on the platform. Your workspace has been linked immediately!'
+    // If membership exists and is Pending (and not expired)
+    if (!forceReinvite && existingMembership && existingMembership.status === 'Pending' && existingMembership.invite_expires_at && new Date(existingMembership.invite_expires_at) > new Date()) {
+      return res.status(400).json({
+        error: 'An invitation is already pending for this vendor.'
       });
     }
 
-    // 4. If global user does NOT have a password yet or force_reinvite is requested
+    // 3. Issue fresh Pending membership
     const inviteToken = crypto.randomBytes(32).toString('hex');
     const inviteExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-    const membershipId = existingMembership.rowCount > 0 ? existingMembership.rows[0].id : crypto.randomUUID();
+    const membershipId = existingMembership ? existingMembership.id : crypto.randomUUID();
 
-    if (existingMembership.rowCount > 0) {
+    if (existingMembership) {
       await queryMaster(
         'UPDATE global_portal_memberships SET entity_id = ?, status = ?, invite_token = ?, invite_expires_at = ? WHERE id = ?',
         [vendorId, 'Pending', inviteToken, inviteExpires, membershipId]
@@ -2871,20 +2858,25 @@ router.post('/vendors/:id/portal-invite', requireAuth, requirePermission('partie
       [vendorId]
     ).catch(() => {});
 
-    const inviteLink = `${base}/portal/accept-invite?token=${inviteToken}&company=${companyId}&type=vendor`;
+    // Link: existing user with password logs in to Connections page; passwordless gets set-password link
+    const inviteLink = globalUser.password_hash
+      ? `${base}/login?portal=partner&redirect=/portal/connections`
+      : `${base}/portal/accept-invite?token=${inviteToken}&company=${companyId}&type=vendor`;
 
-    return res.status(201).json({
+    const compRes = await queryMaster('SELECT company_name FROM companies WHERE id = ?', [companyId]);
+    const workspaceName = compRes.rows[0]?.company_name || 'A client workspace';
+    const inviteText = globalUser.password_hash
+      ? `${workspaceName} wants to connect with you. Please sign in to your Partner Portal to review and accept the connection request:\n${inviteLink}`
+      : `Hello ${name.trim()},\n\nYou have been invited by ${workspaceName} to access the Partner Portal. Please set your password here:\n${inviteLink}`;
+
+    return res.status(200).json({
       ok: true,
-      already_registered: false,
-      reinvited: forceReinvite,
       portal_user_id: globalUser.id,
       email: normalizedEmail,
-      invite_token: inviteToken,
       invite_link: inviteLink,
+      invite_text: inviteText,
       expires_at: inviteExpires,
-      message: forceReinvite
-        ? 'A fresh activation and password setup link has been generated!'
-        : 'Portal invitation generated successfully!'
+      message: 'Portal invitation sent successfully.'
     });
   } catch (err) {
     console.error('vendor portal invite error', err);
@@ -2968,14 +2960,23 @@ async function handlePortalAcceptInvite(req, res, forcedPortalType = null) {
       [hash, globalUser.id]
     );
 
-    // Activate all memberships for this user
-    await queryMaster(
-      'UPDATE global_portal_memberships SET status = ?, joined_at = NOW(), invite_token = NULL, invite_expires_at = NULL WHERE global_user_id = ?',
-      ['Active', globalUser.id]
-    );
+    // Activate ONLY this specific membership that the token belongs to
+    if (membership) {
+      await queryMaster(
+        'UPDATE global_portal_memberships SET status = ?, joined_at = NOW(), invite_token = NULL, invite_expires_at = NULL WHERE id = ?',
+        ['Active', membership.id]
+      );
+    } else {
+      await queryMaster(
+        'UPDATE global_portal_memberships SET status = ?, joined_at = NOW(), invite_token = NULL, invite_expires_at = NULL WHERE global_user_id = ? AND company_id = ? AND portal_type = ?',
+        ['Active', globalUser.id, targetCompanyId, portalType]
+      );
+    }
 
     const memberships = await getGlobalUserMemberships(globalUser.id, portalType);
-    const activeMembership = memberships.find((m) => m.company_id === targetCompanyId) || memberships[0];
+    const activeMembership = (membership ? memberships.find((m) => m.id === membership.id) : null)
+      || memberships.find((m) => m.company_id === targetCompanyId && m.status === 'Active')
+      || memberships[0];
 
     if (!activeMembership) {
       return res.status(400).json({ error: 'No active workspace membership found for this invite' });
@@ -3437,75 +3438,54 @@ router.post('/customers/:id/portal-invite', requireAuth, requirePermission('part
     const custPhone = customer.phone || customer.contact || phone || null;
     const custContactPerson = customer.contact_person_name || name || customer.name;
 
-    // 1. Check or create/update global portal user with all customer details entered by ERP admin
-    let globalUser = await createOrUpdateGlobalPortalUser({
-      email: normalizedEmail,
-      name: custContactPerson,
-      phone: custPhone,
-      company_name: customer.name,
-      gstin: customer.gstin || null,
-      pan: customer.pan || (customer.gstin && customer.gstin.length === 15 ? customer.gstin.slice(2, 12) : null),
-      address: custAddress,
-      city: customer.city || null,
-      state: customer.state || null,
-      pincode: customer.pincode || null,
-      business_type: 'Customer / Buyer'
-    });
+    // 1. Check or create global portal user with customer details entered by ERP admin
+    let globalUser = await getGlobalPortalUserByEmail(normalizedEmail);
+    if (!globalUser) {
+      globalUser = await createOrUpdateGlobalPortalUser({
+        email: normalizedEmail,
+        name: custContactPerson,
+        phone: custPhone,
+        company_name: customer.name,
+        gstin: customer.gstin || null,
+        pan: customer.pan || (customer.gstin && customer.gstin.length === 15 ? customer.gstin.slice(2, 12) : null),
+        address: custAddress,
+        city: customer.city || null,
+        state: customer.state || null,
+        pincode: customer.pincode || null,
+        business_type: 'Customer / Buyer'
+      });
+    }
 
-    const existingMembership = await queryMaster(
+    // 2. Check if membership already exists for this company
+    const memRes = await queryMaster(
       'SELECT * FROM global_portal_memberships WHERE global_user_id = ? AND company_id = ? AND portal_type = ?',
       [globalUser.id, companyId, 'customer']
     );
+    const existingMembership = memRes.rowCount > 0 ? memRes.rows[0] : null;
 
     const base = getFrontendBaseUrl(req);
     const forceReinvite = Boolean(req.body.force_reinvite || req.body.reset_password);
 
-    if (!forceReinvite && existingMembership.rowCount > 0 && existingMembership.rows[0].status === 'Active') {
-      const inviteLink = `${base}/login?portal=partner&company=${companyId}`;
-      return res.status(200).json({
-        ok: true,
-        already_registered: true,
-        can_reinvite: true,
-        message: 'This customer is already connected to your portal.',
-        invite_link: inviteLink
+    // If membership exists and is Active
+    if (!forceReinvite && existingMembership && existingMembership.status === 'Active') {
+      return res.status(400).json({
+        error: 'This customer is already connected to your portal.'
       });
     }
 
-    if (!forceReinvite && globalUser.password_hash) {
-      const membershipId = existingMembership.rowCount > 0 ? existingMembership.rows[0].id : crypto.randomUUID();
-      if (existingMembership.rowCount > 0) {
-        await queryMaster(
-          'UPDATE global_portal_memberships SET entity_id = ?, status = ?, joined_at = NOW() WHERE id = ?',
-          [customerId, 'Active', membershipId]
-        );
-      } else {
-        await queryMaster(
-          `INSERT INTO global_portal_memberships (id, global_user_id, company_id, entity_id, portal_type, status, joined_at)
-           VALUES (?, ?, ?, ?, 'customer', 'Active', NOW())`,
-          [membershipId, globalUser.id, companyId, customerId]
-        );
-      }
-
-      await syncTenantPortalUser(req.tenantDb, 'customer', globalUser, customerId, companyId);
-      await req.tenantDb.query("UPDATE customers SET connection_status = 'connected' WHERE id = ?", [customerId]).catch(() => {});
-      const inviteLink = `${base}/login?portal=partner&company=${companyId}`;
-
-      return res.status(201).json({
-        ok: true,
-        already_registered: true,
-        can_reinvite: true,
-        portal_user_id: globalUser.id,
-        email: normalizedEmail,
-        invite_link: inviteLink,
-        message: 'Customer already has an active account on the platform. Your workspace has been linked immediately!'
+    // If membership exists and is Pending (and not expired)
+    if (!forceReinvite && existingMembership && existingMembership.status === 'Pending' && existingMembership.invite_expires_at && new Date(existingMembership.invite_expires_at) > new Date()) {
+      return res.status(400).json({
+        error: 'An invitation is already pending for this customer.'
       });
     }
 
+    // 3. Issue fresh Pending membership
     const inviteToken = crypto.randomBytes(32).toString('hex');
     const inviteExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-    const membershipId = existingMembership.rowCount > 0 ? existingMembership.rows[0].id : crypto.randomUUID();
+    const membershipId = existingMembership ? existingMembership.id : crypto.randomUUID();
 
-    if (existingMembership.rowCount > 0) {
+    if (existingMembership) {
       await queryMaster(
         'UPDATE global_portal_memberships SET entity_id = ?, status = ?, invite_token = ?, invite_expires_at = ? WHERE id = ?',
         [customerId, 'Pending', inviteToken, inviteExpires, membershipId]
@@ -3531,20 +3511,25 @@ router.post('/customers/:id/portal-invite', requireAuth, requirePermission('part
       [customerId]
     ).catch(() => {});
 
-    const inviteLink = `${base}/portal/accept-invite?token=${inviteToken}&company=${companyId}&type=customer`;
+    // Link: existing user with password logs in to Connections page; passwordless gets set-password link
+    const inviteLink = globalUser.password_hash
+      ? `${base}/login?portal=partner&redirect=/portal/connections`
+      : `${base}/portal/accept-invite?token=${inviteToken}&company=${companyId}&type=customer`;
 
-    return res.status(201).json({
+    const compRes = await queryMaster('SELECT company_name FROM companies WHERE id = ?', [companyId]);
+    const workspaceName = compRes.rows[0]?.company_name || 'A client workspace';
+    const inviteText = globalUser.password_hash
+      ? `${workspaceName} wants to connect with you. Please sign in to your Partner Portal to review and accept the connection request:\n${inviteLink}`
+      : `Hello ${name.trim()},\n\nYou have been invited by ${workspaceName} to access the Partner Portal. Please set your password here:\n${inviteLink}`;
+
+    return res.status(200).json({
       ok: true,
-      already_registered: false,
-      reinvited: forceReinvite,
       portal_user_id: globalUser.id,
       email: normalizedEmail,
-      invite_token: inviteToken,
       invite_link: inviteLink,
+      invite_text: inviteText,
       expires_at: inviteExpires,
-      message: forceReinvite
-        ? 'A fresh activation and password setup link has been generated!'
-        : 'Portal invitation generated successfully!'
+      message: 'Portal invitation sent successfully.'
     });
   } catch (err) {
     console.error('customer portal invite error', err);

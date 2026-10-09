@@ -258,7 +258,20 @@ router.put('/:id/role', requireAuth, requirePermission('users', 'edit'), async (
     }
 
     await req.tenantDb.query('UPDATE users SET role = ?, roles = ? WHERE id = ?', [primaryRole, rolesString, targetId]);
-    await queryMaster('UPDATE company_users SET role = ?, roles = ? WHERE user_id = ? AND company_id = ?', [primaryRole, rolesString, targetId, companyId]);
+
+    // Synchronize Master DB company_users (update existing or insert if missing)
+    const cuRes = await queryMaster(
+      'UPDATE company_users SET role = ?, roles = ? WHERE (user_id = ? OR (email = ? AND company_id = ?))',
+      [primaryRole, rolesString, targetId, targetUser.email, companyId]
+    );
+    if (!cuRes || cuRes.rowCount === 0) {
+      const companyUserId = crypto.randomUUID();
+      await queryMaster(
+        `INSERT INTO company_users (id, company_id, email, user_id, role, roles, status)
+         VALUES (?, ?, ?, ?, ?, ?, 'active')`,
+        [companyUserId, companyId, targetUser.email, targetId, primaryRole, rolesString]
+      ).catch(() => {});
+    }
 
     // Ensure default permissions are applied
     await ensureDefaultRolePermissions(req.tenantDb);

@@ -923,7 +923,7 @@ function registerMasterTable(routerPath, table, searchFields, sortMapping) {
 
 registerMasterTable('raw-materials', 'raw_materials', ['name', 'unit'], { name: 'name', reorder_level: 'reorder_level' });
 
-router.get('/finished-goods', requireAuth, async (req, res) => {
+router.get('/finished-goods', requireAuth, requirePermission('catalog', 'view'), async (req, res) => {
   try {
     const rawLocId = req.query.location_id;
     const locationId = rawLocId && rawLocId !== 'undefined' && rawLocId !== 'null' && String(rawLocId).trim() !== '' ? String(rawLocId).trim() : null;
@@ -1333,7 +1333,7 @@ router.delete('/customers/:id', requireAuth, requirePermission('parties', 'delet
 // to handle individual procurement record operations (including the
 // multi-line ledger reversal fix from Part 0).
 
-router.get('/procurements/:id', requireAuth, async (req, res) => {
+router.get('/procurements/:id', requireAuth, requirePermission('procurement', 'view'), async (req, res) => {
   try {
     const record = await req.tenantDb.query(
       `SELECT p.*, v.name AS vendor_name, v.vendor_code, v.gstin AS vendor_gstin,
@@ -1525,7 +1525,7 @@ router.get('/production-input-options', requireAuth, async (req, res) => {
 });
 
 // Production Batches
-router.get('/production-batches', requireAuth, async (req, res) => {
+router.get('/production-batches', requireAuth, requirePermission('production', 'view'), async (req, res) => {
   const params = [];
   const where = ['pb.deleted_at IS NULL'];
   if (req.query.process_stage_id) where.push(`pb.process_stage_id = ${pushParam(params, req.query.process_stage_id)}`);
@@ -1714,7 +1714,7 @@ router.post('/production-batches', requireAuth, requirePermission('production', 
   }
 });
 
-router.get('/production-batches/:id', requireAuth, async (req, res) => {
+router.get('/production-batches/:id', requireAuth, requirePermission('production', 'view'), async (req, res) => {
   const record = await req.tenantDb.query(
     `SELECT pb.*, ps.name AS stage_name, fg.name AS finished_good_name
      FROM production_batches pb
@@ -1808,7 +1808,7 @@ router.delete('/production-batches/:id', requireAuth, requirePermission('product
 });
 
 // Sales
-router.get('/sales', requireAuth, async (req, res) => {
+router.get('/sales', requireAuth, requirePermission('sales', 'view'), async (req, res) => {
   const params = [];
   const where = ['s.deleted_at IS NULL'];
   if (req.query.customer_id) where.push(`s.customer_id = ${pushParam(params, req.query.customer_id)}`);
@@ -1979,7 +1979,7 @@ router.post('/sales', requireAuth, requirePermission('sales', 'create'), async (
   }
 });
 
-router.get('/sales/:id', requireAuth, async (req, res) => {
+router.get('/sales/:id', requireAuth, requirePermission('sales', 'view'), async (req, res) => {
   const record = await req.tenantDb.query(
     `SELECT s.*, c.name AS customer_name, fg.name AS product_name, fg.unit
      FROM sales s
@@ -2095,7 +2095,7 @@ router.get('/expenses', requireAuth, requirePermission('expenses', 'view'), asyn
   return sendList(req, res, rows.rows, count.rows[0].count, summary.rows[0]);
 });
 
-router.get('/expenses/:id', requireAuth, async (req, res) => {
+router.get('/expenses/:id', requireAuth, requirePermission('expenses', 'view'), async (req, res) => {
   try {
     const record = await req.tenantDb.query(
       `SELECT e.*, u.name AS user_name, u.email AS user_email, u.role AS user_role

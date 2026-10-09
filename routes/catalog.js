@@ -25,22 +25,33 @@ router.get('/numbering-series/next/:type', requireAuth, async (req, res) => {
   }
 });
 
-// Check GSTIN and PAN uniqueness all over the ERP portal
+// Check GSTIN and PAN uniqueness in the current workspace, and global email alignment
 router.get('/parties/check-tax-unique', requireAuth, async (req, res) => {
   try {
-    const { gstin, pan, exclude_id } = req.query;
-    const currentCompanyId = req.user?.company_id || req.user?.workspace_id;
+    const { gstin, pan, email, exclude_id, type } = req.query;
     const duplicateError = await checkGstinAndPanUniqueness({
       tenantDb: req.tenantDb,
       currentId: exclude_id || null,
       gstin: gstin || null,
       pan: pan || null,
-      currentCompanyId
+      partyType: type || null
     });
 
     if (duplicateError) {
       return res.json({ available: false, error: duplicateError });
     }
+
+    if (gstin && email) {
+      const emailAlignmentError = await checkGlobalGstinEmailAlignment({
+        gstin,
+        email,
+        partyType: type || 'vendor'
+      });
+      if (emailAlignmentError) {
+        return res.json({ available: false, error: emailAlignmentError });
+      }
+    }
+
     return res.json({ available: true });
   } catch (err) {
     console.error('check-tax-unique error', err);
@@ -134,8 +145,11 @@ router.get('/vendors', requireAuth, requirePermission('parties', 'view'), async 
         COALESCE((SELECT SUM(p.amount_due) FROM procurements p WHERE p.vendor_id = v.id AND p.deleted_at IS NULL), 0) AS outstanding_balance,
         (SELECT COUNT(*) FROM procurements p WHERE p.vendor_id = v.id AND p.deleted_at IS NULL) AS total_orders_count,
         CASE
-          WHEN v.connection_status = 'connected' OR (SELECT COUNT(*) FROM vendor_portal_users vpu WHERE vpu.vendor_id = v.id AND (vpu.last_login_at IS NOT NULL OR vpu.password_hash IS NOT NULL)) > 0 THEN 'member'
-          WHEN v.connection_status = 'invited' OR (SELECT COUNT(*) FROM vendor_portal_users vpu WHERE vpu.vendor_id = v.id) > 0 THEN 'invited'
+          WHEN v.connection_status = 'connected' THEN 'member'
+          WHEN v.connection_status = 'declined' THEN 'declined'
+          WHEN v.connection_status = 'invited' THEN 'invited'
+          WHEN (SELECT COUNT(*) FROM vendor_portal_users vpu WHERE vpu.vendor_id = v.id AND (vpu.last_login_at IS NOT NULL OR vpu.password_hash IS NOT NULL)) > 0 THEN 'member'
+          WHEN (SELECT COUNT(*) FROM vendor_portal_users vpu WHERE vpu.vendor_id = v.id) > 0 THEN 'invited'
           ELSE 'not_invited'
         END AS portal_status,
         (SELECT COUNT(*) FROM vendor_portal_users vpu WHERE vpu.vendor_id = v.id AND (vpu.last_login_at IS NOT NULL OR vpu.password_hash IS NOT NULL)) AS portal_logged_in_count,
@@ -236,128 +250,121 @@ function validatePartyInput({ name, code, phone, email, pincode, gstin, pan, ban
   return null;
 }
 
-// Uniqueness checker for GSTIN and PAN across the ERP portal
-async function checkGstinAndPanUniqueness({ tenantDb, currentId, gstin, pan, currentCompanyId }) {
+// Uniqueness checker for GSTIN and PAN strictly inside the current workspace's tenant database
+async function checkGstinAndPanUniqueness({ tenantDb, currentId, gstin, pan, partyType = null }) {
   const cleanGstin = gstin && typeof gstin === 'string' && gstin.trim() ? gstin.trim().toUpperCase() : null;
   const cleanPan = pan && typeof pan === 'string' && pan.trim() ? pan.trim().toUpperCase() : null;
 
   if (!cleanGstin && !cleanPan) return null;
 
-  // 1. Check in the current company's tenant database
-  if (cleanGstin) {
-    const vCheck = await tenantDb.query(
-      `SELECT id, name, vendor_code FROM vendors 
-       WHERE UPPER(TRIM(gstin)) = ? AND (? IS NULL OR id != ?) AND deleted_at IS NULL LIMIT 1`,
-      [cleanGstin, currentId || null, currentId || null]
-    );
-    if (vCheck.rows && vCheck.rows.length > 0) {
-      return `GSTIN "${cleanGstin}" is already registered by vendor "${vCheck.rows[0].name}" (${vCheck.rows[0].vendor_code || 'Vendor'}). GSTIN must be unique all over the ERP portal.`;
-    }
-
-    const cCheck = await tenantDb.query(
-      `SELECT id, name, customer_code FROM customers 
-       WHERE UPPER(TRIM(gstin)) = ? AND (? IS NULL OR id != ?) AND deleted_at IS NULL LIMIT 1`,
-      [cleanGstin, currentId || null, currentId || null]
-    );
-    if (cCheck.rows && cCheck.rows.length > 0) {
-      return `GSTIN "${cleanGstin}" is already registered by customer "${cCheck.rows[0].name}" (${cCheck.rows[0].customer_code || 'Customer'}). GSTIN must be unique all over the ERP portal.`;
-    }
-  }
-
-  if (cleanPan) {
-    const vPanCheck = await tenantDb.query(
-      `SELECT id, name, vendor_code FROM vendors 
-       WHERE UPPER(TRIM(pan)) = ? AND (? IS NULL OR id != ?) AND deleted_at IS NULL LIMIT 1`,
-      [cleanPan, currentId || null, currentId || null]
-    );
-    if (vPanCheck.rows && vPanCheck.rows.length > 0) {
-      return `PAN "${cleanPan}" is already registered by vendor "${vPanCheck.rows[0].name}" (${vPanCheck.rows[0].vendor_code || 'Vendor'}). PAN must be unique all over the ERP portal.`;
-    }
-
-    const cPanCheck = await tenantDb.query(
-      `SELECT id, name, customer_code FROM customers 
-       WHERE UPPER(TRIM(pan)) = ? AND (? IS NULL OR id != ?) AND deleted_at IS NULL LIMIT 1`,
-      [cleanPan, currentId || null, currentId || null]
-    );
-    if (cPanCheck.rows && cPanCheck.rows.length > 0) {
-      return `PAN "${cleanPan}" is already registered by customer "${cPanCheck.rows[0].name}" (${cPanCheck.rows[0].customer_code || 'Customer'}). PAN must be unique all over the ERP portal.`;
-    }
-  }
-
-  // 2. Check in master database: Companies
-  if (cleanGstin) {
-    const compGstin = await queryMaster(
-      `SELECT id, company_name, company_code FROM companies 
-       WHERE UPPER(TRIM(gstin)) = ? AND status != 'deleted' LIMIT 1`,
-      [cleanGstin]
-    );
-    if (compGstin.rows && compGstin.rows.length > 0) {
-      return `GSTIN "${cleanGstin}" is already registered by workspace company "${compGstin.rows[0].company_name}". GSTIN must be unique all over the ERP portal.`;
-    }
-  }
-
-  if (cleanPan) {
-    const compPan = await queryMaster(
-      `SELECT id, company_name, company_code FROM companies 
-       WHERE UPPER(TRIM(pan)) = ? AND status != 'deleted' LIMIT 1`,
-      [cleanPan]
-    );
-    if (compPan.rows && compPan.rows.length > 0) {
-      return `PAN "${cleanPan}" is already registered by workspace company "${compPan.rows[0].company_name}". PAN must be unique all over the ERP portal.`;
-    }
-  }
-
-  // 3. Check across other active company tenant databases
-  try {
-    const otherCompanies = await queryMaster(
-      `SELECT id, company_name, database_name FROM companies 
-       WHERE status != 'deleted' AND (? IS NULL OR id != ?)`,
-      [currentCompanyId || null, currentCompanyId || null]
-    );
-
-    for (const comp of otherCompanies.rows) {
-      if (!comp.database_name) continue;
-      try {
-        const otherPool = getTenantPool(comp.database_name);
-        if (cleanGstin) {
-          const otherV = await otherPool.query(
-            `SELECT id, name FROM vendors WHERE UPPER(TRIM(gstin)) = ? AND deleted_at IS NULL LIMIT 1`,
-            [cleanGstin]
-          );
-          if (otherV.rows && otherV.rows.length > 0) {
-            return `GSTIN "${cleanGstin}" is already registered in the ERP portal (by vendor "${otherV.rows[0].name}" in workspace "${comp.company_name}"). GSTIN must be unique all over the ERP portal.`;
-          }
-          const otherC = await otherPool.query(
-            `SELECT id, name FROM customers WHERE UPPER(TRIM(gstin)) = ? AND deleted_at IS NULL LIMIT 1`,
-            [cleanGstin]
-          );
-          if (otherC.rows && otherC.rows.length > 0) {
-            return `GSTIN "${cleanGstin}" is already registered in the ERP portal (by customer "${otherC.rows[0].name}" in workspace "${comp.company_name}"). GSTIN must be unique all over the ERP portal.`;
-          }
-        }
-
-        if (cleanPan) {
-          const otherVPan = await otherPool.query(
-            `SELECT id, name FROM vendors WHERE UPPER(TRIM(pan)) = ? AND deleted_at IS NULL LIMIT 1`,
-            [cleanPan]
-          );
-          if (otherVPan.rows && otherVPan.rows.length > 0) {
-            return `PAN "${cleanPan}" is already registered in the ERP portal (by vendor "${otherVPan.rows[0].name}" in workspace "${comp.company_name}"). PAN must be unique all over the ERP portal.`;
-          }
-          const otherCPan = await otherPool.query(
-            `SELECT id, name FROM customers WHERE UPPER(TRIM(pan)) = ? AND deleted_at IS NULL LIMIT 1`,
-            [cleanPan]
-          );
-          if (otherCPan.rows && otherCPan.rows.length > 0) {
-            return `PAN "${cleanPan}" is already registered in the ERP portal (by customer "${otherCPan.rows[0].name}" in workspace "${comp.company_name}"). PAN must be unique all over the ERP portal.`;
-          }
-        }
-      } catch (poolErr) {
-        // Continue checking next tenant
+  // Vendor-vs-vendor and customer-vs-customer duplicates inside the same workspace stay blocked.
+  // Vendor-vs-customer with the same GSTIN/PAN inside one workspace is ALLOWED.
+  if (partyType === 'vendor' || !partyType) {
+    if (cleanGstin) {
+      const vCheck = await tenantDb.query(
+        `SELECT id, name, vendor_code FROM vendors 
+         WHERE UPPER(TRIM(gstin)) = ? AND (? IS NULL OR id != ?) AND deleted_at IS NULL LIMIT 1`,
+        [cleanGstin, currentId || null, currentId || null]
+      );
+      if (vCheck.rows && vCheck.rows.length > 0) {
+        return `GSTIN "${cleanGstin}" is already registered by vendor "${vCheck.rows[0].name}" (${vCheck.rows[0].vendor_code || 'Vendor'}).`;
       }
     }
+
+    if (cleanPan) {
+      const vPanCheck = await tenantDb.query(
+        `SELECT id, name, vendor_code FROM vendors 
+         WHERE UPPER(TRIM(pan)) = ? AND (? IS NULL OR id != ?) AND deleted_at IS NULL LIMIT 1`,
+        [cleanPan, currentId || null, currentId || null]
+      );
+      if (vPanCheck.rows && vPanCheck.rows.length > 0) {
+        return `PAN "${cleanPan}" is already registered by vendor "${vPanCheck.rows[0].name}" (${vPanCheck.rows[0].vendor_code || 'Vendor'}).`;
+      }
+    }
+  }
+
+  if (partyType === 'customer' || !partyType) {
+    if (cleanGstin) {
+      const cCheck = await tenantDb.query(
+        `SELECT id, name, customer_code FROM customers 
+         WHERE UPPER(TRIM(gstin)) = ? AND (? IS NULL OR id != ?) AND deleted_at IS NULL LIMIT 1`,
+        [cleanGstin, currentId || null, currentId || null]
+      );
+      if (cCheck.rows && cCheck.rows.length > 0) {
+        return `GSTIN "${cleanGstin}" is already registered by customer "${cCheck.rows[0].name}" (${cCheck.rows[0].customer_code || 'Customer'}).`;
+      }
+    }
+
+    if (cleanPan) {
+      const cPanCheck = await tenantDb.query(
+        `SELECT id, name, customer_code FROM customers 
+         WHERE UPPER(TRIM(pan)) = ? AND (? IS NULL OR id != ?) AND deleted_at IS NULL LIMIT 1`,
+        [cleanPan, currentId || null, currentId || null]
+      );
+      if (cPanCheck.rows && cPanCheck.rows.length > 0) {
+        return `PAN "${cleanPan}" is already registered by customer "${cPanCheck.rows[0].name}" (${cPanCheck.rows[0].customer_code || 'Customer'}).`;
+      }
+    }
+  }
+
+  return null;
+}
+
+// Ensures global email alignment for a given GSTIN to maintain unified partner portal space
+async function checkGlobalGstinEmailAlignment({ gstin, email, partyType = 'vendor' }) {
+  const cleanGstin = gstin && typeof gstin === 'string' && gstin.trim() ? gstin.trim().toUpperCase() : null;
+  if (!cleanGstin) return null;
+
+  const enteredEmail = email && typeof email === 'string' && email.trim() ? email.trim().toLowerCase() : null;
+
+  let registeredEmail = null;
+
+  // 1. Check global_portal_users in masterDb
+  try {
+    const gpuRes = await queryMaster(
+      `SELECT email, name, company_name FROM global_portal_users 
+       WHERE UPPER(TRIM(gstin)) = ? AND email IS NOT NULL AND TRIM(email) != '' LIMIT 1`,
+      [cleanGstin]
+    );
+    if (gpuRes.rows && gpuRes.rows.length > 0 && gpuRes.rows[0].email) {
+      registeredEmail = gpuRes.rows[0].email.trim().toLowerCase();
+    }
   } catch (err) {
-    console.error('Error during cross-tenant tax uniqueness check:', err);
+    console.error('checkGlobalGstinEmailAlignment master query error:', err);
+  }
+
+  // 2. If not found in global_portal_users, check across active tenant databases
+  if (!registeredEmail) {
+    try {
+      const compRes = await queryMaster("SELECT database_name FROM companies WHERE status = 'active'");
+      const tenantDbs = (compRes.rows || []).map((c) => c.database_name).filter(Boolean);
+      const table = partyType === 'customer' ? 'customers' : 'vendors';
+
+      for (const dbName of tenantDbs) {
+        try {
+          const tDb = getTenantPool(dbName);
+          const tRes = await tDb.query(
+            `SELECT email FROM ${table} 
+             WHERE UPPER(TRIM(gstin)) = ? AND email IS NOT NULL AND TRIM(email) != '' AND deleted_at IS NULL LIMIT 1`,
+            [cleanGstin]
+          );
+          if (tRes.rows && tRes.rows.length > 0 && tRes.rows[0].email) {
+            registeredEmail = tRes.rows[0].email.trim().toLowerCase();
+            break;
+          }
+        } catch (_) {}
+      }
+    } catch (err) {
+      console.error('checkGlobalGstinEmailAlignment tenant scan error:', err);
+    }
+  }
+
+  // 3. If a registered email exists for this GSTIN, enforce that the entered email matches
+  if (registeredEmail) {
+    if (!enteredEmail || enteredEmail !== registeredEmail) {
+      const typeLabel = partyType === 'customer' ? 'Customer' : 'Vendor';
+      return `${typeLabel} with GSTIN "${cleanGstin}" is already registered on the platform with email "${registeredEmail}". Please use "${registeredEmail}" to ensure unified partner portal access.`;
+    }
   }
 
   return null;
@@ -388,13 +395,12 @@ router.post('/vendors', requireAuth, requirePermission('parties', 'create'), asy
     return res.status(400).json({ error: validationError });
   }
 
-  const currentCompanyId = req.user?.company_id || req.user?.workspace_id;
   const duplicateTaxError = await checkGstinAndPanUniqueness({
     tenantDb: req.tenantDb,
     currentId: null,
     gstin,
     pan,
-    currentCompanyId
+    partyType: 'vendor'
   });
   if (duplicateTaxError) {
     return res.status(400).json({ error: duplicateTaxError });
@@ -411,6 +417,15 @@ router.post('/vendors', requireAuth, requirePermission('parties', 'create'), asy
   const finalContact = contact || finalPhone || finalContactPerson || null;
   const finalAddress1 = street || address_line1 || address || null;
   const finalAddress = address || street || address_line1 || null;
+
+  const emailAlignmentError = await checkGlobalGstinEmailAlignment({
+    gstin,
+    email: finalEmail,
+    partyType: 'vendor'
+  });
+  if (emailAlignmentError) {
+    return res.status(400).json({ error: emailAlignmentError });
+  }
 
   try {
     const code = vendor_code && vendor_code.trim()
@@ -554,16 +569,34 @@ router.put('/vendors/:id', requireAuth, requirePermission('parties', 'edit'), as
     return res.status(400).json({ error: validationError });
   }
 
-  const currentCompanyId = req.user?.company_id || req.user?.workspace_id;
   const duplicateTaxError = await checkGstinAndPanUniqueness({
     tenantDb: req.tenantDb,
     currentId: req.params.id,
     gstin,
     pan,
-    currentCompanyId
+    partyType: 'vendor'
   });
   if (duplicateTaxError) {
     return res.status(400).json({ error: duplicateTaxError });
+  }
+
+  const vExistingRes = await req.tenantDb.query('SELECT gstin, email FROM vendors WHERE id = ?', [req.params.id]);
+  const existingVendor = (vExistingRes.rows && vExistingRes.rows[0]) || {};
+  const contactList = Array.isArray(contacts) ? contacts : null;
+  const primaryContact = contactList && contactList.length > 0 ? contactList[0] : {};
+
+  const targetGstin = gstin !== undefined ? gstin : existingVendor.gstin;
+  const targetEmail = (email !== undefined || (primaryContact && primaryContact.email !== undefined))
+    ? (email || primaryContact.email || null)
+    : existingVendor.email;
+
+  const emailAlignmentError = await checkGlobalGstinEmailAlignment({
+    gstin: targetGstin,
+    email: targetEmail,
+    partyType: 'vendor'
+  });
+  if (emailAlignmentError) {
+    return res.status(400).json({ error: emailAlignmentError });
   }
 
   const updates = [];
@@ -578,9 +611,6 @@ router.put('/vendors/:id', requireAuth, requirePermission('parties', 'edit'), as
     updates.push('vendor_code = ?');
     params.push(vendor_code && vendor_code.trim() ? vendor_code.trim().toUpperCase() : null);
   }
-
-  const contactList = Array.isArray(contacts) ? contacts : null;
-  const primaryContact = contactList && contactList.length > 0 ? contactList[0] : {};
 
   if (contact_person_name !== undefined || primaryContact.name !== undefined) {
     updates.push('contact_person_name = ?');
@@ -1111,8 +1141,11 @@ router.get('/customers', requireAuth, requirePermission('parties', 'view'), asyn
         COALESCE((SELECT SUM(s.amount_due) FROM sales s WHERE s.customer_id = c.id AND s.deleted_at IS NULL), 0) AS outstanding_balance,
         (SELECT COUNT(*) FROM sales s WHERE s.customer_id = c.id AND s.deleted_at IS NULL) AS total_orders_count,
         CASE
-          WHEN c.connection_status = 'connected' OR (SELECT COUNT(*) FROM customer_portal_users cpu WHERE cpu.customer_id = c.id AND (cpu.last_login_at IS NOT NULL OR cpu.password_hash IS NOT NULL)) > 0 THEN 'member'
-          WHEN c.connection_status = 'invited' OR (SELECT COUNT(*) FROM customer_portal_users cpu WHERE cpu.customer_id = c.id) > 0 THEN 'invited'
+          WHEN c.connection_status = 'connected' THEN 'member'
+          WHEN c.connection_status = 'declined' THEN 'declined'
+          WHEN c.connection_status = 'invited' THEN 'invited'
+          WHEN (SELECT COUNT(*) FROM customer_portal_users cpu WHERE cpu.customer_id = c.id AND (cpu.last_login_at IS NOT NULL OR cpu.password_hash IS NOT NULL)) > 0 THEN 'member'
+          WHEN (SELECT COUNT(*) FROM customer_portal_users cpu WHERE cpu.customer_id = c.id) > 0 THEN 'invited'
           ELSE 'not_invited'
         END AS portal_status,
         (SELECT COUNT(*) FROM customer_portal_users cpu WHERE cpu.customer_id = c.id AND (cpu.last_login_at IS NOT NULL OR cpu.password_hash IS NOT NULL)) AS portal_logged_in_count,
@@ -1221,13 +1254,12 @@ router.post('/customers', requireAuth, requirePermission('parties', 'create'), a
     return res.status(400).json({ error: validationError });
   }
 
-  const currentCompanyId = req.user?.company_id || req.user?.workspace_id;
   const duplicateTaxError = await checkGstinAndPanUniqueness({
     tenantDb: req.tenantDb,
     currentId: null,
     gstin,
     pan,
-    currentCompanyId
+    partyType: 'customer'
   });
   if (duplicateTaxError) {
     return res.status(400).json({ error: duplicateTaxError });
@@ -1250,6 +1282,15 @@ router.post('/customers', requireAuth, requirePermission('parties', 'create'), a
   const finalContact = contact || finalPhone || finalContactPerson || null;
   const finalBillingAddress = street || billing_address || address || null;
   const finalAddress = address || street || billing_address || null;
+
+  const emailAlignmentError = await checkGlobalGstinEmailAlignment({
+    gstin,
+    email: finalEmail,
+    partyType: 'customer'
+  });
+  if (emailAlignmentError) {
+    return res.status(400).json({ error: emailAlignmentError });
+  }
 
   try {
     const code = customer_code && customer_code.trim() ? customer_code.trim().toUpperCase() : await getNextDocumentNumber(req.tenantDb, 'customer');
@@ -1302,16 +1343,34 @@ router.put('/customers/:id', requireAuth, requirePermission('parties', 'edit'), 
     return res.status(400).json({ error: validationError });
   }
 
-  const updateCompanyId = req.user?.company_id || req.user?.workspace_id;
   const duplicateTaxError = await checkGstinAndPanUniqueness({
     tenantDb: req.tenantDb,
     currentId: req.params.id,
     gstin,
     pan,
-    currentCompanyId: updateCompanyId
+    partyType: 'customer'
   });
   if (duplicateTaxError) {
     return res.status(400).json({ error: duplicateTaxError });
+  }
+
+  const cExistingRes = await req.tenantDb.query('SELECT gstin, email FROM customers WHERE id = ?', [req.params.id]);
+  const existingCustomer = (cExistingRes.rows && cExistingRes.rows[0]) || {};
+  const contactList = Array.isArray(contacts) ? contacts : null;
+  const primaryContact = contactList && contactList.length > 0 ? contactList[0] : {};
+
+  const targetGstin = gstin !== undefined ? gstin : existingCustomer.gstin;
+  const targetEmail = (email !== undefined || (primaryContact && primaryContact.email !== undefined))
+    ? (email || primaryContact.email || null)
+    : existingCustomer.email;
+
+  const emailAlignmentError = await checkGlobalGstinEmailAlignment({
+    gstin: targetGstin,
+    email: targetEmail,
+    partyType: 'customer'
+  });
+  if (emailAlignmentError) {
+    return res.status(400).json({ error: emailAlignmentError });
   }
 
   const updates = [];
@@ -1326,9 +1385,6 @@ router.put('/customers/:id', requireAuth, requirePermission('parties', 'edit'), 
     updates.push('customer_code = ?');
     params.push(customer_code && customer_code.trim() ? customer_code.trim().toUpperCase() : null);
   }
-
-  const contactList = Array.isArray(contacts) ? contacts : null;
-  const primaryContact = contactList && contactList.length > 0 ? contactList[0] : {};
 
   if (contact_person_name !== undefined || primaryContact.name !== undefined) {
     updates.push('contact_person_name = ?');
