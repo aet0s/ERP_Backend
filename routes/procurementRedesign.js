@@ -461,6 +461,11 @@ router.post('/procurements', requireAuth, requirePermission('procurement', 'crea
     const grossTotal = taxableSubtotal + totalTax;
     const finalDiscountPercent = Number(effectiveDiscPct.toFixed(2));
     const paid = Math.max(0, numeric(amount_paid));
+    if (paid > grossTotal + 0.001) {
+      return res.status(400).json({
+        error: `Amount Paid Now (${paid}) cannot be higher than the overall total of the bill generated (${grossTotal.toFixed(2)})`
+      });
+    }
     const isReceiveNow = Boolean(req.body.receive_immediately || req.body.status === 'Received');
     const initialStatus = isReceiveNow ? 'Received' : 'Sent to Vendor';
 
@@ -551,15 +556,15 @@ router.post('/procurements', requireAuth, requirePermission('procurement', 'crea
       );
     }
 
-    // Send notification if sent to vendor immediately
-    if (send_to_vendor) {
+    // Send notification to vendor portal when order is placed
+    if (!isReceiveNow && vendor_id) {
       await createNotification(req.tenantDb, {
         user_type: 'vendor_portal',
         vendor_id,
         title: 'New Purchase Order Received',
         message: `Purchase Order ${procNumber} for ₹${grossTotal.toLocaleString('en-IN')} has been sent to your vendor portal.`,
-        link: `/vendor-portal/orders/${procId}`
-      });
+        link: `/portal/orders`
+      }).catch(() => {});
     }
 
     await req.tenantDb.query('COMMIT');
@@ -661,6 +666,12 @@ router.post('/procurements/:id/receive', requireAuth, requirePermission('procure
       return res.status(400).json({ error: 'Goods have already been received for this procurement' });
     }
 
+    if (proc.status !== 'Dispatched by Vendor' && proc.status !== 'Dispatched') {
+      return res.status(400).json({
+        error: `Cannot receive goods yet. The vendor must accept and dispatch the order first (Current order status: ${proc.status}).`
+      });
+    }
+
     const itemsRes = await req.tenantDb.query('SELECT * FROM procurement_items WHERE procurement_id = ?', [req.params.id]);
     let items = itemsRes.rows;
 
@@ -722,6 +733,16 @@ router.post('/procurements/:id/receive', requireAuth, requirePermission('procure
       link: `/procurement`
     });
 
+    if (proc.vendor_id) {
+      await createNotification(req.tenantDb, {
+        user_type: 'vendor_portal',
+        vendor_id: proc.vendor_id,
+        title: 'Goods Received by Buyer',
+        message: `Buyer has confirmed delivery and received goods for Order ${proc.procurement_number}.`,
+        link: '/portal/orders'
+      }).catch(() => {});
+    }
+
     await req.tenantDb.query('COMMIT');
     return res.json({ ok: true, message: 'Physical goods received and inventory ledger IN entries updated' });
   } catch (err) {
@@ -740,6 +761,12 @@ router.post('/purchase-orders/:id/receive', requireAuth, requirePermission('proc
 
     if (po.status === 'Received') {
       return res.status(400).json({ error: 'Goods have already been received for this PO' });
+    }
+
+    if (po.status !== 'Dispatched by Vendor' && po.status !== 'Dispatched') {
+      return res.status(400).json({
+        error: `Cannot receive goods yet. The vendor must accept and dispatch the PO first (Current PO status: ${po.status}).`
+      });
     }
 
     // Check if there is an existing procurement linked to this PO
