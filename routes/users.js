@@ -32,45 +32,47 @@ router.get('/', requireAuth, requirePermission('users', 'view'), async (req, res
     } catch {}
 
     const page = Math.max(1, parseInt(req.query.page || '1', 10));
-    const limit = Math.max(1, Math.min(100, parseInt(req.query.limit || req.query.page_size || '20', 10)));
+    const limit = Math.max(1, Math.min(10000, parseInt(req.query.limit || req.query.page_size || '20', 10)));
     const offset = (page - 1) * limit;
     const search = (req.query.search || '').trim().toLowerCase();
     const roleFilter = (req.query.role || '').trim().toLowerCase();
     const statusFilter = (req.query.status || '').trim();
+    await req.tenantDb.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS location_id VARCHAR(36) NULL').catch(() => {});
+
     const startDate = (req.query.start_date || '').trim();
     const endDate = (req.query.end_date || '').trim();
 
-    let whereConditions = ['deleted_at IS NULL'];
+    let whereConditions = ['u.deleted_at IS NULL'];
     const params = [];
 
     if (search) {
-      whereConditions.push('(LOWER(name) LIKE ? OR LOWER(email) LIKE ? OR LOWER(role) LIKE ?)');
+      whereConditions.push('(LOWER(u.name) LIKE ? OR LOWER(u.email) LIKE ? OR LOWER(u.role) LIKE ?)');
       params.push(`%${search}%`, `%${search}%`, `%${search}%`);
     }
 
     if (roleFilter) {
-      whereConditions.push('(LOWER(role) = ? OR LOWER(roles) LIKE ? OR LOWER(roles) LIKE ?)');
+      whereConditions.push('(LOWER(u.role) = ? OR LOWER(u.roles) LIKE ? OR LOWER(u.roles) LIKE ?)');
       params.push(roleFilter, `%"${roleFilter}"%`, `%${roleFilter}%`);
     }
 
     if (statusFilter) {
-      whereConditions.push('LOWER(status) = ?');
+      whereConditions.push('LOWER(u.status) = ?');
       params.push(statusFilter.toLowerCase());
     }
 
     if (startDate) {
-      whereConditions.push('DATE(created_at) >= ?');
+      whereConditions.push('DATE(u.created_at) >= ?');
       params.push(startDate);
     }
 
     if (endDate) {
-      whereConditions.push('DATE(created_at) <= ?');
+      whereConditions.push('DATE(u.created_at) <= ?');
       params.push(endDate);
     }
 
     const whereClause = whereConditions.join(' AND ');
 
-    const countRes = await req.tenantDb.query(`SELECT COUNT(*) AS total FROM users WHERE ${whereClause}`, params);
+    const countRes = await req.tenantDb.query(`SELECT COUNT(*) AS total FROM users u WHERE ${whereClause}`, params);
     const total = countRes.rows && countRes.rows[0] ? Number(countRes.rows[0].total || countRes.rows[0]['COUNT(*)'] || 0) : 0;
 
     const allowedSortCols = ['name', 'email', 'role', 'status', 'created_at'];
@@ -78,10 +80,11 @@ router.get('/', requireAuth, requirePermission('users', 'view'), async (req, res
     const sortDir = req.query.sort_order?.toLowerCase() === 'asc' ? 'ASC' : 'DESC';
 
     const listRes = await req.tenantDb.query(
-      `SELECT id, name, email, role, roles, status, is_primary_owner, created_at, last_login_at
-       FROM users
+      `SELECT u.id, u.name, u.email, u.role, u.roles, u.status, u.is_primary_owner, u.location_id, l.name AS location_name, u.created_at, u.last_login_at
+       FROM users u
+       LEFT JOIN locations l ON l.id = u.location_id
        WHERE ${whereClause}
-       ORDER BY ${sortCol} ${sortDir}
+       ORDER BY u.${sortCol} ${sortDir}
        LIMIT ? OFFSET ?`,
       [...params, limit, offset]
     );
@@ -129,7 +132,7 @@ router.get('/', requireAuth, requirePermission('users', 'view'), async (req, res
 
 // Directly create a user
 router.post('/', requireAuth, requirePermission('users', 'create'), async (req, res) => {
-  const { name, email, password, role, roles, vendor_id, customer_id } = req.body;
+  const { name, email, password, role, roles, location_id, vendor_id, customer_id } = req.body;
   const companyId = req.user.company_id || req.user.workspace_id;
   const userId = req.user.user_id || req.user.id;
 
@@ -165,23 +168,32 @@ router.post('/', requireAuth, requirePermission('users', 'create'), async (req, 
 
   try {
     await tenantClient.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS roles TEXT NULL').catch(() => {});
+    await tenantClient.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS location_id VARCHAR(36) NULL').catch(() => {});
     const pw = password || '123456';
     const hash = await bcrypt.hash(pw, BCRYPT_ROUNDS);
     const newUserId = crypto.randomUUID();
 
     await tenantClient.query('START TRANSACTION');
     await tenantClient.query(
-      'INSERT INTO users (id, name, email, password_hash, role, roles, status) VALUES (?, ?, ?, ?, ?, ?, "active")',
-      [newUserId, name, normalizedEmail, hash, primaryRole, rolesString]
+      'INSERT INTO users (id, name, email, password_hash, role, roles, location_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, "active")',
+      [newUserId, name, normalizedEmail, hash, primaryRole, rolesString, location_id || null]
     );
 
-    const newUser = { id: newUserId, name, email: normalizedEmail, role: primaryRole, roles: assignedRoles };
+    if (location_id) {
+      const ulaId = crypto.randomUUID();
+      await tenantClient.query(
+        'INSERT INTO user_location_assignments (id, user_id, location_id) VALUES (?, ?, ?)',
+        [ulaId, newUserId, location_id]
+      ).catch(() => {});
+    }
+
+    const newUser = { id: newUserId, name, email: normalizedEmail, role: primaryRole, roles: assignedRoles, location_id };
 
     const auditId = crypto.randomUUID();
     await tenantClient.query(
       `INSERT INTO audit_log (id, user_id, action, entity_type, entity_id, metadata)
        VALUES (?, ?, 'create', 'user', ?, ?)`,
-      [auditId, userId, newUser.id, JSON.stringify({ email: normalizedEmail, role: primaryRole, roles: assignedRoles, vendor_id, customer_id })]
+      [auditId, userId, newUser.id, JSON.stringify({ email: normalizedEmail, role: primaryRole, roles: assignedRoles, location_id, vendor_id, customer_id })]
     );
     await tenantClient.query('COMMIT');
 
@@ -204,34 +216,28 @@ router.post('/', requireAuth, requirePermission('users', 'create'), async (req, 
   }
 });
 
-// Update user roles
-router.put('/:id/role', requireAuth, requirePermission('users', 'edit'), async (req, res) => {
-  const { role, roles } = req.body;
-  const { primaryRole, assignedRoles, rolesString } = normaliseAssignment(role, roles);
-
-  // Reject roles not in ASSIGNABLE_ROLES (400)
-  for (const r of assignedRoles) {
-    if (!ASSIGNABLE_ROLES.includes(r)) {
-      return res.status(400).json({ error: `Unknown or unassignable role: '${r}'` });
-    }
-  }
-
+// Update user (roles, status, location, password)
+async function handleUpdateUser(req, res) {
+  const { role, roles, status, location_id, password } = req.body;
   const companyId = req.user.company_id || req.user.workspace_id;
   const targetId = req.params.id;
+  const currentUserId = req.user.user_id || req.user.id;
 
   const requesterRoles = req.user.roles && Array.isArray(req.user.roles) ? req.user.roles : [req.user.role];
-  const isOwnerOrAdmin = requesterRoles.includes('owner') || requesterRoles.includes('admin') || req.user.role === 'owner' || req.user.role === 'admin';
-  if (!isOwnerOrAdmin && (assignedRoles.includes('owner') || assignedRoles.includes('admin'))) {
-    return res.status(403).json({ error: 'Only workspace owners and administrators can assign owner or admin roles.' });
-  }
+  const isOwner = requesterRoles.includes('owner') || req.user.role === 'owner';
+  const isOwnerOrAdmin = isOwner || requesterRoles.includes('admin') || req.user.role === 'admin';
 
   try {
     await req.tenantDb.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS roles TEXT NULL').catch(() => {});
+    await req.tenantDb.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS location_id VARCHAR(36) NULL').catch(() => {});
     await req.tenantDb.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS is_primary_owner TINYINT(1) NOT NULL DEFAULT 0').catch(() => {});
     await queryMaster('ALTER TABLE company_users ADD COLUMN IF NOT EXISTS roles TEXT NULL').catch(() => {});
 
-    // Check if target is primary owner
-    const targetRes = await req.tenantDb.query('SELECT id, email, role, roles, is_primary_owner FROM users WHERE id = ?', [targetId]);
+    // Check target user
+    const targetRes = await req.tenantDb.query(
+      'SELECT id, name, email, role, roles, status, location_id, is_primary_owner FROM users WHERE id = ? AND deleted_at IS NULL',
+      [targetId]
+    );
     if (targetRes.rowCount === 0) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -253,40 +259,146 @@ router.put('/:id/role', requireAuth, requirePermission('users', 'edit'), async (
       (primaryOwnerEmail && targetUser.email === primaryOwnerEmail)
     );
 
-    if (isPrimary && !assignedRoles.includes('owner')) {
-      return res.status(400).json({ error: 'The primary workspace owner role cannot be demoted or removed.' });
+    // 1. Password change validation: ONLY owner has this provision to change password of any user
+    let newPasswordHash = null;
+    if (password !== undefined && password !== null && String(password).trim() !== '') {
+      if (!isOwner) {
+        return res.status(403).json({ error: 'Only the workspace owner has permission to change user passwords.' });
+      }
+      const passError = validateStrongPassword(password);
+      if (passError) {
+        return res.status(400).json({ error: passError });
+      }
+      newPasswordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
     }
 
-    await req.tenantDb.query('UPDATE users SET role = ?, roles = ? WHERE id = ?', [primaryRole, rolesString, targetId]);
+    // 2. Status validation & toggle
+    let newStatus = targetUser.status || 'active';
+    if (status) {
+      const validStatuses = ['active', 'inactive'];
+      if (!validStatuses.includes(status.toLowerCase())) {
+        return res.status(400).json({ error: 'Invalid status. Must be "active" or "inactive".' });
+      }
+      if (isPrimary && status.toLowerCase() === 'inactive') {
+        return res.status(400).json({ error: 'The primary workspace owner cannot be deactivated.' });
+      }
+      if (targetId === currentUserId && status.toLowerCase() === 'inactive') {
+        return res.status(400).json({ error: 'You cannot deactivate your own account.' });
+      }
+      newStatus = status.toLowerCase();
+    }
 
-    // Synchronize Master DB company_users (update existing or insert if missing)
-    const cuRes = await queryMaster(
-      'UPDATE company_users SET role = ?, roles = ? WHERE (user_id = ? OR (email = ? AND company_id = ?))',
-      [primaryRole, rolesString, targetId, targetUser.email, companyId]
-    );
-    if (!cuRes || cuRes.rowCount === 0) {
-      const companyUserId = crypto.randomUUID();
-      await queryMaster(
-        `INSERT INTO company_users (id, company_id, email, user_id, role, roles, status)
-         VALUES (?, ?, ?, ?, ?, ?, 'active')`,
-        [companyUserId, companyId, targetUser.email, targetId, primaryRole, rolesString]
+    // 3. Roles validation
+    let primaryRole = targetUser.role || 'staff';
+    let rolesString = targetUser.roles || primaryRole;
+    let assignedRoles = resolveUserRoles(targetUser.role, targetUser.roles);
+
+    if (role || roles) {
+      const norm = normaliseAssignment(role || targetUser.role, roles);
+      primaryRole = norm.primaryRole;
+      assignedRoles = norm.assignedRoles;
+      rolesString = norm.rolesString;
+
+      for (const r of assignedRoles) {
+        if (!ASSIGNABLE_ROLES.includes(r)) {
+          return res.status(400).json({ error: `Unknown or unassignable role: '${r}'` });
+        }
+      }
+
+      if (!isOwnerOrAdmin && (assignedRoles.includes('owner') || assignedRoles.includes('admin'))) {
+        return res.status(403).json({ error: 'Only workspace owners and administrators can assign owner or admin roles.' });
+      }
+
+      if (isPrimary && !assignedRoles.includes('owner')) {
+        return res.status(400).json({ error: 'The primary workspace owner role cannot be demoted or removed.' });
+      }
+    }
+
+    // 4. Location assignment
+    let newLocationId = targetUser.location_id;
+    if (location_id !== undefined) {
+      newLocationId = location_id ? String(location_id).trim() : null;
+    }
+
+    // 5. Update tenant DB users table
+    const updates = ['role = ?', 'roles = ?', 'status = ?', 'location_id = ?'];
+    const updateParams = [primaryRole, rolesString, newStatus, newLocationId];
+
+    if (newPasswordHash) {
+      updates.push('password_hash = ?');
+      updateParams.push(newPasswordHash);
+    }
+
+    updateParams.push(targetId);
+    await req.tenantDb.query(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`, updateParams);
+
+    // Sync location assignment table
+    if (newLocationId) {
+      await req.tenantDb.query('DELETE FROM user_location_assignments WHERE user_id = ?', [targetId]).catch(() => {});
+      const ulaId = crypto.randomUUID();
+      await req.tenantDb.query(
+        'INSERT INTO user_location_assignments (id, user_id, location_id) VALUES (?, ?, ?)',
+        [ulaId, targetId, newLocationId]
       ).catch(() => {});
+    } else if (location_id === null || location_id === '') {
+      await req.tenantDb.query('DELETE FROM user_location_assignments WHERE user_id = ?', [targetId]).catch(() => {});
     }
 
-    // Ensure default permissions are applied
-    await ensureDefaultRolePermissions(req.tenantDb);
+    // 6. Sync Master DB company_users
+    await queryMaster(
+      'UPDATE company_users SET role = ?, roles = ?, status = ? WHERE (user_id = ? OR (email = ? AND company_id = ?))',
+      [primaryRole, rolesString, newStatus, targetId, targetUser.email, companyId]
+    ).catch(() => {});
 
-    // Read stored role back from the database for the response
-    const readBack = await req.tenantDb.query('SELECT role, roles FROM users WHERE id = ?', [targetId]);
-    const storedUser = readBack.rows[0] || {};
-    const finalRoles = resolveUserRoles(storedUser.role, storedUser.roles);
+    // Ensure permissions
+    await ensureDefaultRolePermissions(req.tenantDb).catch(() => {});
 
-    return res.json({ ok: true, role: storedUser.role || primaryRole, roles: finalRoles });
+    // 7. Audit log
+    const auditId = crypto.randomUUID();
+    await req.tenantDb.query(
+      `INSERT INTO audit_log (id, user_id, action, entity_type, entity_id, metadata)
+       VALUES (?, ?, 'update', 'user', ?, ?)`,
+      [
+        auditId,
+        currentUserId,
+        targetId,
+        JSON.stringify({
+          target_email: targetUser.email,
+          target_name: targetUser.name,
+          roles: assignedRoles,
+          status: newStatus,
+          location_id: newLocationId,
+          password_changed: Boolean(newPasswordHash)
+        })
+      ]
+    ).catch(() => {});
+
+    // Read back updated user
+    const readBack = await req.tenantDb.query(
+      `SELECT u.id, u.name, u.email, u.phone, u.role, u.roles, u.status, u.is_primary_owner, u.location_id, l.name AS location_name, u.created_at, u.last_login_at
+       FROM users u
+       LEFT JOIN locations l ON l.id = u.location_id
+       WHERE u.id = ?`,
+      [targetId]
+    );
+    const updatedUser = readBack.rows[0] || {};
+    updatedUser.roles = resolveUserRoles(updatedUser.role, updatedUser.roles);
+
+    return res.json({
+      ok: true,
+      message: 'User updated successfully',
+      user: updatedUser,
+      role: updatedUser.role || primaryRole,
+      roles: updatedUser.roles
+    });
   } catch (err) {
-    console.error('update user role error', err);
-    return res.status(500).json({ error: 'Failed to update user roles' });
+    console.error('update user error', err);
+    return res.status(500).json({ error: err.message || 'Failed to update user' });
   }
-});
+}
+
+router.put('/:id', requireAuth, requirePermission('users', 'edit'), handleUpdateUser);
+router.put('/:id/role', requireAuth, requirePermission('users', 'edit'), handleUpdateUser);
 
 // Soft-delete user from workspace
 router.delete('/:id', requireAuth, requirePermission('users', 'delete'), async (req, res) => {
@@ -358,7 +470,7 @@ router.get('/invites', requireAuth, requirePermission('users', 'view'), async (r
   const companyId = req.user.company_id || req.user.workspace_id;
   try {
     const page = Math.max(1, parseInt(req.query.page || '1', 10));
-    const limit = Math.max(1, Math.min(100, parseInt(req.query.limit || req.query.page_size || '20', 10)));
+    const limit = Math.max(1, Math.min(10000, parseInt(req.query.limit || req.query.page_size || '20', 10)));
     const offset = (page - 1) * limit;
     const search = (req.query.search || '').trim().toLowerCase();
     const roleFilter = (req.query.role || '').trim().toLowerCase();
@@ -422,7 +534,7 @@ router.get('/invites', requireAuth, requirePermission('users', 'view'), async (r
 
 // Create invite
 router.post('/invites', requireAuth, requirePermission('users', 'create'), async (req, res) => {
-  const { email, role } = req.body;
+  const { email, role, location_id } = req.body;
   const companyId = req.user.company_id || req.user.workspace_id;
   const userId = req.user.user_id || req.user.id;
 
@@ -454,14 +566,16 @@ router.post('/invites', requireAuth, requirePermission('users', 'create'), async
       [companyId, normalizedEmail]
     ).catch(() => {});
 
+    await queryMaster('ALTER TABLE company_invites ADD COLUMN IF NOT EXISTS location_id VARCHAR(36) NULL').catch(() => {});
+
     const token = crypto.randomBytes(24).toString('hex');
     const inviteId = crypto.randomUUID();
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
     await queryMaster(
-      `INSERT INTO company_invites (id, company_id, email, role, token, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [inviteId, companyId, normalizedEmail, role, token, expiresAt]
+      `INSERT INTO company_invites (id, company_id, email, role, location_id, token, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [inviteId, companyId, normalizedEmail, role, location_id || null, token, expiresAt]
     );
 
     const inviteRecord = {
@@ -469,6 +583,7 @@ router.post('/invites', requireAuth, requirePermission('users', 'create'), async
       company_id: companyId,
       email: normalizedEmail,
       role,
+      location_id: location_id || null,
       token,
       expires_at: expiresAt,
       created_at: new Date()
@@ -479,7 +594,7 @@ router.post('/invites', requireAuth, requirePermission('users', 'create'), async
       await req.tenantDb.query(
         `INSERT INTO audit_log (id, user_id, action, entity_type, entity_id, metadata)
          VALUES (?, ?, 'invite', 'user', NULL, ?)`,
-        [auditId, userId, JSON.stringify({ email: normalizedEmail, role })]
+        [auditId, userId, JSON.stringify({ email: normalizedEmail, role, location_id: location_id || null })]
       ).catch(() => {});
     }
 
@@ -565,11 +680,14 @@ router.get('/:id', requireAuth, requirePermission('users', 'view'), async (req, 
 
     await req.tenantDb.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(50) NULL').catch(() => {});
     await req.tenantDb.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS roles TEXT NULL').catch(() => {});
+    await req.tenantDb.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS location_id VARCHAR(36) NULL').catch(() => {});
     await req.tenantDb.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS is_primary_owner TINYINT(1) NOT NULL DEFAULT 0').catch(() => {});
 
     const uRes = await req.tenantDb.query(
-      `SELECT id, name, email, phone, role, roles, status, is_primary_owner, created_at, last_login_at
-       FROM users WHERE id = ? AND deleted_at IS NULL`,
+      `SELECT u.id, u.name, u.email, u.phone, u.role, u.roles, u.status, u.is_primary_owner, u.location_id, l.name AS location_name, u.created_at, u.last_login_at
+       FROM users u
+       LEFT JOIN locations l ON l.id = u.location_id
+       WHERE u.id = ? AND u.deleted_at IS NULL`,
       [targetId]
     );
 
@@ -606,6 +724,39 @@ router.get('/:id', requireAuth, requirePermission('users', 'view'), async (req, 
   }
 });
 
+// Get user-specific audit trail (no leakage of other tenant users)
+router.get('/:id/audit-trail', requireAuth, requirePermission('users', 'view'), async (req, res) => {
+  const targetId = req.params.id;
+  try {
+    const listRes = await req.tenantDb.query(
+      `SELECT al.id, al.user_id, al.action, al.entity_type, al.entity_id, al.metadata, al.created_at,
+              u.name AS actor_name, u.email AS actor_email
+       FROM audit_log al
+       LEFT JOIN users u ON u.id = al.user_id
+       WHERE al.user_id = ? OR (al.entity_type = 'user' AND al.entity_id = ?)
+       ORDER BY al.created_at DESC
+       LIMIT 50`,
+      [targetId, targetId]
+    );
+
+    const logs = (listRes.rows || []).map((row) => {
+      let meta = row.metadata;
+      if (typeof meta === 'string') {
+        try { meta = JSON.parse(meta); } catch {}
+      }
+      return {
+        ...row,
+        metadata: meta
+      };
+    });
+
+    return res.json({ audit_trail: logs, items: logs });
+  } catch (err) {
+    console.error('get user audit trail error', err);
+    return res.status(500).json({ error: 'Failed to fetch user audit trail' });
+  }
+});
+
 function validateStrongPassword(password) {
   if (!password || typeof password !== 'string') return 'Password is required';
   if (password.length < 8) return 'Password must be at least 8 characters long';
@@ -630,7 +781,7 @@ router.post('/accept-invite', async (req, res) => {
 
   // Single O(1) Master DB lookup
   const inviteRes = await queryMaster(
-    `SELECT ci.id, ci.company_id, ci.email, ci.role, ci.accepted_at, ci.expires_at, c.database_name, c.status AS company_status
+    `SELECT ci.id, ci.company_id, ci.email, ci.role, ci.location_id, ci.accepted_at, ci.expires_at, c.database_name, c.status AS company_status
      FROM company_invites ci
      JOIN companies c ON c.id = ci.company_id
      WHERE ci.token = ?`,
@@ -661,6 +812,7 @@ router.post('/accept-invite', async (req, res) => {
 
   try {
     await tenantClient.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS roles TEXT NULL').catch(() => {});
+    await tenantClient.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS location_id VARCHAR(36) NULL').catch(() => {});
     await tenantClient.query('START TRANSACTION');
     const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
     const newUserId = crypto.randomUUID();
@@ -671,22 +823,31 @@ router.post('/accept-invite', async (req, res) => {
     if (existingTenantUser.rowCount > 0) {
       resolvedUserId = existingTenantUser.rows[0].id;
       await tenantClient.query(
-        `UPDATE users SET name = ?, password_hash = ?, role = ?, roles = ?, status = 'active', deleted_at = NULL, last_login_at = NOW() WHERE email = ?`,
-        [displayName, hash, inviteRecord.role, inviteRecord.role, normalizedEmail]
+        `UPDATE users SET name = ?, password_hash = ?, role = ?, roles = ?, location_id = COALESCE(?, location_id), status = 'active', deleted_at = NULL, last_login_at = NOW() WHERE email = ?`,
+        [displayName, hash, inviteRecord.role, inviteRecord.role, inviteRecord.location_id || null, normalizedEmail]
       );
     } else {
       await tenantClient.query(
-        `INSERT INTO users (id, name, email, password_hash, role, roles, status, last_login_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'active', NOW())`,
-        [newUserId, displayName, normalizedEmail, hash, inviteRecord.role, inviteRecord.role]
+        `INSERT INTO users (id, name, email, password_hash, role, roles, location_id, status, last_login_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', NOW())`,
+        [newUserId, displayName, normalizedEmail, hash, inviteRecord.role, inviteRecord.role, inviteRecord.location_id || null]
       );
+    }
+
+    if (inviteRecord.location_id) {
+      await tenantClient.query('DELETE FROM user_location_assignments WHERE user_id = ?', [resolvedUserId]).catch(() => {});
+      const ulaId = crypto.randomUUID();
+      await tenantClient.query(
+        'INSERT INTO user_location_assignments (id, user_id, location_id) VALUES (?, ?, ?)',
+        [ulaId, resolvedUserId, inviteRecord.location_id]
+      ).catch(() => {});
     }
 
     const auditId = crypto.randomUUID();
     await tenantClient.query(
       `INSERT INTO audit_log (id, user_id, action, entity_type, entity_id, metadata)
        VALUES (?, ?, 'accept_invite', 'user', ?, ?)`,
-      [auditId, resolvedUserId, resolvedUserId, JSON.stringify({ email: normalizedEmail, role: inviteRecord.role, name: displayName })]
+      [auditId, resolvedUserId, resolvedUserId, JSON.stringify({ email: normalizedEmail, role: inviteRecord.role, name: displayName, location_id: inviteRecord.location_id })]
     );
     await tenantClient.query('COMMIT');
 

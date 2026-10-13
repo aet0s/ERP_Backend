@@ -25,6 +25,7 @@
     "jsonwebtoken": "^9.0.3",
     "mysql2": "^3.23.3",
     "node-fetch": "^3.3.2",
+    "nodemailer": "^10.1.0",
     "pdfkit": "^0.19.1",
     "ws": "^8.18.3"
   },

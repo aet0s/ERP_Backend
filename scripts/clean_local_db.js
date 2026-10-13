@@ -46,8 +46,9 @@ async function cleanLocalDatabase() {
     // 1. Find all tenant databases
     const [rows] = await rootConn.query(`
       SELECT SCHEMA_NAME AS dbName FROM information_schema.SCHEMATA
-      WHERE SCHEMA_NAME LIKE 'erp_company_%'
-    `);
+      WHERE (SCHEMA_NAME LIKE 'erp_company_%' OR SCHEMA_NAME LIKE 'erp_%')
+        AND SCHEMA_NAME != ?
+    `, [masterDbName]);
 
     const tenantDbs = rows.map(r => r.dbName);
     console.log(`\n[Step 1/4] Found ${tenantDbs.length} local tenant database(s) to delete:`);

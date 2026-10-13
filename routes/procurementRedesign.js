@@ -458,7 +458,12 @@ router.post('/procurements', requireAuth, requirePermission('procurement', 'crea
       });
     }
 
-    const grossTotal = taxableSubtotal + totalTax;
+    const rawTotal = taxableSubtotal + totalTax;
+    // Round off: if decimal >= 0.50, round up (+remaining); if < 0.50, round down (-decimal)
+    const roundedGrandTotal = Math.round(rawTotal);
+    const roundOffAmount = Number((roundedGrandTotal - rawTotal).toFixed(2));
+    const grossTotal = roundedGrandTotal;
+
     const finalDiscountPercent = Number(effectiveDiscPct.toFixed(2));
     const paid = Math.max(0, numeric(amount_paid));
     if (paid > grossTotal + 0.001) {
@@ -492,17 +497,26 @@ router.post('/procurements', requireAuth, requirePermission('procurement', 'crea
       }
     }
 
-    const targetLocationId = req.body.location_id || null;
+    let targetLocationId = req.body.location_id || null;
+    if (!targetLocationId) {
+      const defLoc = await req.tenantDb.query('SELECT id FROM locations WHERE is_default = 1 AND deleted_at IS NULL LIMIT 1');
+      if (defLoc.rowCount > 0) {
+        targetLocationId = defLoc.rows[0].id;
+      } else {
+        const anyLoc = await req.tenantDb.query('SELECT id FROM locations WHERE deleted_at IS NULL LIMIT 1');
+        if (anyLoc.rowCount > 0) targetLocationId = anyLoc.rows[0].id;
+      }
+    }
     const due = Math.max(0, grossTotal - paid);
 
     await req.tenantDb.query(
       `INSERT INTO procurements (
         id, procurement_number, purchase_order_id, vendor_id, location_id, raw_material_id, quantity, rate_per_unit,
-        subtotal, tax_amount, discount_amount, discount_percent, total_amount, amount_paid, amount_due, date, notes, status, sent_at, received_date
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        subtotal, tax_amount, discount_amount, discount_percent, round_off_amount, total_amount, amount_paid, amount_due, date, notes, status, sent_at, received_date
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [
         procId, procNumber, purchase_order_id || null, vendor_id, targetLocationId, rawMaterialFk, processedLines[0].quantity, processedLines[0].rate_per_unit,
-        taxableSubtotal, totalTax, finalDiscountAmount, finalDiscountPercent, grossTotal, paid, due, date || new Date().toISOString().slice(0, 10), notes, initialStatus,
+        taxableSubtotal, totalTax, finalDiscountAmount, finalDiscountPercent, roundOffAmount, grossTotal, paid, due, date || new Date().toISOString().slice(0, 10), notes, initialStatus,
         new Date(), isReceiveNow ? new Date() : null
       ]
     );
@@ -700,13 +714,24 @@ router.post('/procurements/:id/receive', requireAuth, requirePermission('procure
     }
 
     // WRITE INVENTORY LEDGER IN ENTRIES STRICTLY HERE!
+    let receiveLocId = proc.location_id;
+    if (!receiveLocId) {
+      const defLoc = await req.tenantDb.query('SELECT id FROM locations WHERE is_default = 1 AND deleted_at IS NULL LIMIT 1');
+      if (defLoc.rowCount > 0) {
+        receiveLocId = defLoc.rows[0].id;
+      } else {
+        const anyLoc = await req.tenantDb.query('SELECT id FROM locations WHERE deleted_at IS NULL LIMIT 1');
+        if (anyLoc.rowCount > 0) receiveLocId = anyLoc.rows[0].id;
+      }
+    }
+
     for (const item of items) {
       const ledgerId = crypto.randomUUID();
       await req.tenantDb.query(
         `INSERT INTO inventory_ledger (
           id, item_type, item_id, transaction_type, quantity, unit_cost, location_id, reason, reference_table, reference_id, created_by
         ) VALUES (?, 'raw_material', ?, 'in', ?, ?, ?, ?, 'procurements', ?, ?)`,
-        [ledgerId, item.item_id, item.quantity, item.rate_per_unit, proc.location_id, `Procurement Received ${proc.procurement_number}`, proc.id, userId]
+        [ledgerId, item.item_id, item.quantity, item.rate_per_unit, receiveLocId, `Procurement Received ${proc.procurement_number}`, proc.id, userId]
       );
 
       // Recalculate weighted average cost
@@ -920,9 +945,51 @@ router.get('/procurements/:id/payments', requireAuth, async (req, res) => {
     proc.amount_to_return = fin.amount_to_return;
     proc.payment_status = fin.payment_status;
 
+    // Gather returned items for this procurement (prioritizing official debit notes)
+    const dnItemsRes = await req.tenantDb.query(
+      `SELECT dni.*, dni.line_total, COALESCE(rm.name, i.name, 'Item') AS name, COALESCE(rm.unit, i.unit, 'units') AS unit,
+              dn.debit_note_number
+       FROM debit_note_items dni
+       JOIN debit_notes dn ON dn.id = dni.debit_note_id
+       LEFT JOIN raw_materials rm ON rm.id = dni.item_id
+       LEFT JOIN items i ON i.id = dni.item_id
+       WHERE dn.procurement_id = ?`,
+      [req.params.id]
+    );
+
+    let returnedItems = [];
+    if (dnItemsRes.rows && dnItemsRes.rows.length > 0) {
+      returnedItems = dnItemsRes.rows.map(it => ({
+        ...it,
+        name: it.name,
+        item_name: it.name,
+        line_total: Number(it.line_total || (it.quantity * it.rate_per_unit))
+      }));
+    } else {
+      const rrRes = await req.tenantDb.query(
+        `SELECT * FROM return_requests WHERE reference_id = ? AND reference_type = 'procurement' AND status != 'Rejected'`,
+        [req.params.id]
+      );
+      for (const r of rrRes.rows) {
+        try {
+          const items = typeof r.items === 'string' ? JSON.parse(r.items) : (r.items || []);
+          if (Array.isArray(items)) {
+            returnedItems.push(...items.map(it => ({
+              ...it,
+              name: it.item_name || it.name,
+              return_request_number: r.request_number,
+              return_request_status: r.status,
+              line_total: Number(it.line_total || (it.quantity * (it.unit_rate_with_tax || it.rate_per_unit || 0)))
+            })));
+          }
+        } catch (_) {}
+      }
+    }
+
     return res.json({
       procurement: proc,
-      payments
+      payments,
+      returned_items: returnedItems
     });
   } catch (err) {
     console.error('get procurement payments error', err);
@@ -994,6 +1061,201 @@ router.post('/procurements/:id/payments', requireAuth, requirePermission('procur
     await req.tenantDb.query('ROLLBACK').catch(() => {});
     console.error('record procurement payment error', err);
     return res.status(500).json({ error: 'Failed to record vendor payment: ' + err.message });
+  }
+});
+
+router.post('/procurements/:id/refund', requireAuth, requirePermission('procurement', 'create'), async (req, res) => {
+  const { amount, date, reference, notes } = req.body;
+  const refundAmt = Math.max(0, numeric(amount));
+  if (refundAmt <= 0) {
+    return res.status(400).json({ error: 'Valid positive refund amount is required' });
+  }
+
+  const userId = req.user.user_id || req.user.id || null;
+
+  try {
+    await req.tenantDb.query('START TRANSACTION');
+
+    const procRes = await req.tenantDb.query(
+      'SELECT * FROM procurements WHERE id = ? AND deleted_at IS NULL FOR UPDATE',
+      [req.params.id]
+    );
+
+    if (procRes.rowCount === 0) {
+      await req.tenantDb.query('ROLLBACK');
+      return res.status(404).json({ error: 'Procurement not found' });
+    }
+
+    const proc = procRes.rows[0];
+    const dnRes = await req.tenantDb.query(
+      'SELECT COALESCE(SUM(total_amount), 0) AS debit_note_total FROM debit_notes WHERE procurement_id = ?',
+      [req.params.id]
+    );
+    const debitNoteTotal = Number(dnRes.rows[0]?.debit_note_total || 0);
+    const fin = getProcurementFinancials(proc, debitNoteTotal);
+    const refundDue = fin.amount_to_return;
+
+    if (refundDue <= 0.009) {
+      await req.tenantDb.query('ROLLBACK');
+      return res.status(400).json({ error: 'This procurement has no refund due balance from the vendor.' });
+    }
+
+    if (refundAmt > refundDue + 0.01) {
+      await req.tenantDb.query('ROLLBACK');
+      return res.status(400).json({ error: `Refund amount cannot exceed the pending refund due of ₹${refundDue.toFixed(2)}` });
+    }
+
+    // Adjust amount_paid by subtracting the refunded amount
+    const newPaid = Math.max(0, Number((fin.amount_paid - refundAmt).toFixed(2)));
+    const newDue = Math.max(0, Number((fin.net_total - newPaid).toFixed(2)));
+
+    // Status: if net_total is 0 and full refund is accepted, status is 'Returned'
+    let newStatus = proc.status;
+    if (fin.net_total === 0 && (newPaid === 0 || refundAmt >= refundDue - 0.01)) {
+      newStatus = 'Returned';
+    } else if (proc.status === 'Return Accepted by Vendor') {
+      newStatus = (fin.net_total === 0) ? 'Returned' : 'Partially Returned';
+    }
+
+    // Update procurement
+    await req.tenantDb.query(
+      `UPDATE procurements
+       SET total_amount = ?, amount_paid = ?, amount_due = ?, status = ?, updated_at = NOW()
+       WHERE id = ?`,
+      [fin.original_total, newPaid, newDue, newStatus, req.params.id]
+    );
+
+    // Record refund receipt in payments_log
+    const payId = crypto.randomUUID();
+    const payDate = date ? `${date} 12:00:00` : new Date();
+    const refString = reference ? `[${reference}] ` : '';
+    const refundNotes = `Vendor Refund Received: ${refString}${notes || 'Refund of returned items received from vendor'}`;
+    await req.tenantDb.query(
+      `INSERT INTO payments_log (id, related_type, related_id, amount, date, notes, created_by)
+       VALUES (?, 'procurement', ?, ?, ?, ?, ?)`,
+      [payId, req.params.id, -refundAmt, payDate, refundNotes, userId]
+    );
+
+    // INVENTORY UPDATE: Ensure inventory ledger is fully deducted for all returned items
+    const rrRes = await req.tenantDb.query(
+      `SELECT * FROM return_requests WHERE reference_id = ? AND reference_type = 'procurement' AND status != 'Rejected'`,
+      [req.params.id]
+    );
+
+    let locationId = proc.location_id;
+    if (!locationId) {
+      const defLocRes = await req.tenantDb.query('SELECT id FROM locations WHERE is_default = 1 LIMIT 1');
+      locationId = defLocRes.rows[0]?.id || null;
+    }
+    const today = new Date().toISOString().slice(0, 10);
+    const updatedItemIds = new Set();
+
+    for (const rr of rrRes.rows) {
+      let items = [];
+      try {
+        items = typeof rr.items === 'string' ? JSON.parse(rr.items) : (rr.items || []);
+      } catch (_) {}
+
+      for (const item of items) {
+        const itemId = item.item_id || item.raw_material_id;
+        const qty = Number(item.quantity || 0);
+        const unitCost = Number(item.rate_per_unit || item.unit_price || 0);
+        if (!itemId || qty <= 0) continue;
+
+        updatedItemIds.add(itemId);
+
+        // Check if outward ledger entry already exists
+        const existingLedger = await req.tenantDb.query(
+          "SELECT id FROM inventory_ledger WHERE reference_table = 'return_requests' AND reference_id = ? AND item_id = ? AND transaction_type = 'out'",
+          [rr.id, itemId]
+        );
+        if (existingLedger.rowCount === 0) {
+          await req.tenantDb.query(
+            `INSERT INTO inventory_ledger
+               (id, item_type, item_id, location_id, transaction_type, quantity, unit_cost, reference_table, reference_id, reason, created_by, date)
+             VALUES (?, 'raw_material', ?, ?, 'out', ?, ?, 'return_requests', ?, 'Purchase return accepted & refund confirmed', ?, ?)`,
+            [crypto.randomUUID(), itemId, locationId, qty, unitCost, rr.id, userId, today]
+          );
+        }
+      }
+    }
+
+    // Also check debit_notes
+    const dnItemsRes = await req.tenantDb.query(
+      `SELECT dni.*, dn.id AS debit_note_id
+       FROM debit_note_items dni
+       JOIN debit_notes dn ON dn.id = dni.debit_note_id
+       WHERE dn.procurement_id = ?`,
+      [req.params.id]
+    );
+
+    for (const dni of dnItemsRes.rows) {
+      const itemId = dni.item_id;
+      const qty = Number(dni.quantity || 0);
+      const unitCost = Number(dni.rate_per_unit || 0);
+      if (!itemId || qty <= 0) continue;
+
+      updatedItemIds.add(itemId);
+
+      const existingDnLedger = await req.tenantDb.query(
+        "SELECT id FROM inventory_ledger WHERE reference_table = 'debit_notes' AND reference_id = ? AND item_id = ? AND transaction_type = 'out'",
+        [dni.debit_note_id, itemId]
+      );
+      if (existingDnLedger.rowCount === 0) {
+        await req.tenantDb.query(
+          `INSERT INTO inventory_ledger
+             (id, item_type, item_id, location_id, transaction_type, quantity, unit_cost, reference_table, reference_id, reason, created_by, date)
+           VALUES (?, 'raw_material', ?, ?, 'out', ?, ?, 'debit_notes', ?, 'Debit note return refund confirmed', ?, ?)`,
+          [crypto.randomUUID(), itemId, locationId, qty, unitCost, dni.debit_note_id, userId, today]
+        );
+      }
+    }
+
+    // Fallback: If procurement was fully returned and no return requests or debit note items existed,
+    // ensure the procurement's line items are properly deducted in inventory_ledger
+    if (newStatus === 'Returned' && updatedItemIds.size === 0) {
+      const piRes = await req.tenantDb.query('SELECT * FROM procurement_items WHERE procurement_id = ?', [req.params.id]);
+      for (const pi of piRes.rows) {
+        if (!pi.item_id || Number(pi.quantity) <= 0) continue;
+        updatedItemIds.add(pi.item_id);
+        const existingOut = await req.tenantDb.query(
+          "SELECT id FROM inventory_ledger WHERE reference_table = 'procurements' AND reference_id = ? AND item_id = ? AND transaction_type = 'out'",
+          [req.params.id, pi.item_id]
+        );
+        if (existingOut.rowCount === 0) {
+          await req.tenantDb.query(
+            `INSERT INTO inventory_ledger
+               (id, item_type, item_id, location_id, transaction_type, quantity, unit_cost, reference_table, reference_id, reason, created_by, date)
+             VALUES (?, 'raw_material', ?, ?, 'out', ?, ?, 'procurements', ?, 'Full procurement returned and refunded', ?, ?)`,
+            [crypto.randomUUID(), pi.item_id, locationId, Number(pi.quantity), Number(pi.rate_per_unit || 0), req.params.id, userId, today]
+          );
+        }
+      }
+    }
+
+    // Recalculate weighted average costs and update items/raw_materials for all affected items
+    for (const itId of updatedItemIds) {
+      const newWac = await getWeightedAvgCost(req.tenantDb, itId);
+      await req.tenantDb.query('UPDATE items SET last_purchase_price = ?, updated_at = NOW() WHERE id = ?', [newWac, itId]).catch(() => {});
+      await req.tenantDb.query('UPDATE raw_materials SET last_purchase_price = ?, updated_at = NOW() WHERE id = ?', [newWac, itId]).catch(() => {});
+    }
+
+    await req.tenantDb.query('COMMIT');
+
+    return res.status(201).json({
+      success: true,
+      id: payId,
+      amount_refunded: refundAmt,
+      amount_paid: newPaid,
+      amount_due: newDue,
+      status: newStatus,
+      updated_items_count: updatedItemIds.size,
+      message: `Refund of ₹${refundAmt.toFixed(2)} confirmed successfully. Inventory and payments updated.`
+    });
+  } catch (err) {
+    await req.tenantDb.query('ROLLBACK').catch(() => {});
+    console.error('confirm procurement refund error', err);
+    return res.status(500).json({ error: 'Failed to confirm vendor refund: ' + err.message });
   }
 });
 
@@ -1314,6 +1576,22 @@ router.get('/debit-notes/:id', requireAuth, async (req, res) => {
 
     dn.item_count = dn.items.length;
     dn.total_amount = Number(dn.total_amount || 0);
+
+    let subtotal = 0;
+    let totalTax = 0;
+    for (const it of dn.items) {
+      const lineTotal = Number(it.line_total || (it.quantity * it.rate_per_unit));
+      const tRate = Number(it.tax_rate || 0);
+      if (tRate > 0) {
+        const taxable = lineTotal / (1 + tRate / 100);
+        subtotal += taxable;
+        totalTax += (lineTotal - taxable);
+      } else {
+        subtotal += lineTotal;
+      }
+    }
+    dn.subtotal = Number(subtotal.toFixed(2));
+    dn.tax_amount = Number(totalTax.toFixed(2));
 
     // Build timeline entry
     dn.timeline = [

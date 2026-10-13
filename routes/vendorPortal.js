@@ -45,14 +45,19 @@ router.get('/profile', requireVendorPortalAuth, async (req, res) => {
     );
     if (vendorRes.rowCount === 0) return res.status(404).json({ error: 'Vendor not found' });
     
-    // Calculate total statistics across vendor's purchase orders
+    // Calculate total statistics across vendor's purchase orders deducting debit notes
     const statsRes = await req.tenantDb.query(
       `SELECT COUNT(*) AS total_orders,
-              COALESCE(SUM(total_amount), 0) AS total_order_value,
-              COALESCE(SUM(amount_paid), 0) AS total_paid,
-              COALESCE(SUM(amount_due), 0) AS total_due
-       FROM procurements
-       WHERE vendor_id = ? AND deleted_at IS NULL`,
+              COALESCE(SUM(p.total_amount), 0) - COALESCE(SUM(dn_totals.total_dn), 0) AS total_order_value,
+              COALESCE(SUM(p.amount_paid), 0) AS total_paid,
+              GREATEST(0, (COALESCE(SUM(p.total_amount), 0) - COALESCE(SUM(dn_totals.total_dn), 0)) - COALESCE(SUM(p.amount_paid), 0)) AS total_due
+       FROM procurements p
+       LEFT JOIN (
+         SELECT procurement_id, SUM(total_amount) AS total_dn
+         FROM debit_notes
+         GROUP BY procurement_id
+       ) dn_totals ON dn_totals.procurement_id = p.id
+       WHERE p.vendor_id = ? AND p.deleted_at IS NULL`,
       [req.vendorUser.vendor_id]
     );
 
@@ -92,7 +97,8 @@ router.get('/procurements', requireVendorPortalAuth, requirePortalPermission('ve
       `SELECT p.id, p.procurement_number, p.date, p.total_amount, p.amount_paid,
               p.amount_due, p.subtotal, p.tax_amount, p.discount_amount, p.notes,
               COALESCE(p.status, 'Pending Vendor Confirmation') AS status,
-              p.vendor_notes, p.dispatch_tracking_ref, p.created_at
+              p.vendor_notes, p.dispatch_tracking_ref, p.created_at,
+              (SELECT COALESCE(SUM(dn.total_amount), 0) FROM debit_notes dn WHERE dn.procurement_id = p.id) AS debit_note_total
        FROM procurements p
        WHERE ${conditions}
        ORDER BY p.date DESC, p.created_at DESC`,
@@ -102,6 +108,12 @@ router.get('/procurements', requireVendorPortalAuth, requirePortalPermission('ve
     // Fetch line items summary & item count for each procurement
     const procurements = [];
     for (const proc of result.rows) {
+      const dnTotal = Number(proc.debit_note_total || 0);
+      proc.original_total = Number(proc.total_amount || 0);
+      proc.returned_amount = dnTotal;
+      proc.total_amount = Math.max(0, proc.original_total - dnTotal);
+      proc.amount_due = Math.max(0, proc.total_amount - Number(proc.amount_paid || 0));
+
       const itemsRes = await req.tenantDb.query(
         `SELECT pi.item_id, pi.quantity, pi.rate_per_unit, pi.line_total, pi.tax_rate,
                 COALESCE(i.name, rm.name, 'Item') AS item_name, COALESCE(i.unit, rm.unit, 'pcs') AS unit

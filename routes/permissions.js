@@ -8,6 +8,7 @@ const express = require('express');
 const router = express.Router();
 const { requireAuth, requireRole } = require('../middleware/auth');
 const { ROLES, MODULES, ensureDefaultRolePermissions } = require('../lib/defaultPermissions');
+const { logTenantAudit } = require('../lib/auditCrypto');
 
 const MATRIX_SQL = "SELECT role, module, can_view, can_create, can_edit, can_delete, can_approve, can_export FROM role_permissions WHERE role NOT IN ('vendor', 'customer') ORDER BY role, module";
 
@@ -104,6 +105,13 @@ router.put('/', requireAuth, requireRole('owner', 'admin'), async (req, res) => 
 
   try {
     const result = await applyPermissionMatrix(req.tenantDb, permissions);
+    await logTenantAudit(req.tenantDb, {
+      userId: req.user.user_id || req.user.id,
+      action: 'update',
+      entityType: 'permissions',
+      entityId: null,
+      metadata: { modified_count: permissions.length }
+    }).catch(() => {});
     return res.json(result);
   } catch (err) {
     if (err.status === 400 || err.statusCode === 400) {

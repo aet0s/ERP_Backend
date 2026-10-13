@@ -34,7 +34,7 @@ router.get('/reorder-suggestions', requireAuth, requirePermission('reports', 'vi
 function pageParams(req) {
   const page = Math.max(1, parseInt(req.query.page || '1', 10) || 1);
   const requested = parseInt(req.query.page_size || req.query.limit || '20', 10) || 20;
-  const pageSize = [10, 20, 25, 50, 100].includes(requested) ? requested : 20;
+  const pageSize = Math.max(1, Math.min(10000, requested));
   return { page, pageSize, offset: (page - 1) * pageSize };
 }
 

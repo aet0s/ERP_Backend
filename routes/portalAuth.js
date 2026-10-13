@@ -17,7 +17,7 @@ const { createNotification } = require('../lib/notifications');
 const { calculateInvoiceLine, calculateInvoiceTotals, getNextDocumentNumber } = require('../lib/invoiceEngine');
 const { publishReturnRequestMessage } = require('../lib/returnRequestSocket');
 const { getFrontendBaseUrl } = require('../lib/urlUtils');
-const { executeApproveReturnRequest } = require('../lib/returnsEngine');
+const { executeApproveReturnRequest, getSaleFinancials } = require('../lib/returnsEngine');
 
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error('FATAL: JWT_SECRET environment variable is not configured');
@@ -1130,7 +1130,8 @@ router.get(['/orders', '/portal/orders'], requireUniversalPortalAuth, async (req
             ''
           ) AS vendor_address,
           v.name AS vendor_name,
-          'vendor' AS portal_type
+          'vendor' AS portal_type,
+          (SELECT COALESCE(SUM(dn.total_amount), 0) FROM debit_notes dn WHERE dn.procurement_id = p.id) AS debit_note_total
         FROM procurements p
         LEFT JOIN locations loc ON loc.id = p.location_id
         LEFT JOIN vendors v ON v.id = p.vendor_id
@@ -1146,9 +1147,15 @@ router.get(['/orders', '/portal/orders'], requireUniversalPortalAuth, async (req
         const sub = Number(ord.subtotal || 0);
         const tax = Number(ord.tax_amount || ord.total_tax || 0);
         const disc = Number(ord.discount_amount || 0);
+        let origTotal = Number(ord.total_amount || 0);
         if (sub > 0 || tax > 0 || disc > 0) {
-          ord.total_amount = Math.max(0, sub + tax - disc);
+          origTotal = Math.max(0, sub + tax - disc);
         }
+        const dnTotal = Number(ord.debit_note_total || 0);
+        ord.original_total = origTotal;
+        ord.returned_amount = dnTotal;
+        ord.net_total = Math.max(0, origTotal - dnTotal);
+        ord.total_amount = ord.net_total;
         ord.amount_due = Math.max(0, Number(ord.total_amount || 0) - Number(ord.amount_paid || 0));
 
         const itemsRes = await tenantDb.query(
@@ -1307,7 +1314,8 @@ router.get(['/orders', '/portal/orders'], requireUniversalPortalAuth, async (req
           s.dispatch_tracking_ref,
           s.dispatch_date,
           s.created_at,
-          'customer' AS portal_type
+          'customer' AS portal_type,
+          (SELECT COALESCE(SUM(cn.total_amount), 0) FROM credit_notes cn WHERE cn.sale_id = s.id) AS credit_note_total
         FROM sales s
         WHERE ${where}
         ORDER BY s.date DESC, s.created_at DESC
@@ -1317,6 +1325,17 @@ router.get(['/orders', '/portal/orders'], requireUniversalPortalAuth, async (req
       const result = await tenantDb.query(query, [...params, pageSize, offset]);
 
       for (const ord of result.rows) {
+        const cnTotal = Number(ord.credit_note_total || 0);
+        const fin = getSaleFinancials(ord, cnTotal);
+        ord.original_total = fin.original_total;
+        ord.returned_amount = fin.returned_amount;
+        ord.net_total = fin.net_total;
+        ord.total_amount = fin.net_total;
+        ord.amount_paid = fin.amount_received;
+        ord.amount_received = fin.amount_received;
+        ord.amount_due = fin.amount_due;
+        ord.amount_to_return = fin.amount_to_return;
+        ord.payment_status = fin.payment_status;
         const itemsRes = await tenantDb.query(
           `SELECT si.quantity, si.rate_per_unit, si.line_total,
                   COALESCE(si.discount_percent, 0) AS discount_percent,
@@ -1738,11 +1757,16 @@ router.get(['/payments', '/portal/payments'], requireUniversalPortalAuth, async 
 
       const balanceRes = await tenantDb.query(
         `SELECT 
-           COALESCE(SUM(total_amount), 0) AS total_invoiced,
-           COALESCE(SUM(amount_paid), 0) AS total_paid,
-           COALESCE(SUM(amount_due), 0) AS total_due
-         FROM procurements
-         WHERE vendor_id IN (${vPlaceholders}) AND deleted_at IS NULL`,
+           COALESCE(SUM(p.total_amount), 0) - COALESCE(SUM(dn_totals.total_dn), 0) AS total_invoiced,
+           COALESCE(SUM(p.amount_paid), 0) AS total_paid,
+           GREATEST(0, (COALESCE(SUM(p.total_amount), 0) - COALESCE(SUM(dn_totals.total_dn), 0)) - COALESCE(SUM(p.amount_paid), 0)) AS total_due
+         FROM procurements p
+         LEFT JOIN (
+           SELECT procurement_id, SUM(total_amount) AS total_dn
+           FROM debit_notes
+           GROUP BY procurement_id
+         ) dn_totals ON dn_totals.procurement_id = p.id
+         WHERE p.vendor_id IN (${vPlaceholders}) AND p.deleted_at IS NULL`,
         matchedVendorIds
       );
       balanceSummary = {
@@ -1787,9 +1811,9 @@ router.get(['/payments', '/portal/payments'], requireUniversalPortalAuth, async 
           pl.created_at,
           p.id AS order_id,
           p.procurement_number AS order_number,
-          p.total_amount AS order_total,
+          GREATEST(0, p.total_amount - COALESCE((SELECT SUM(dn.total_amount) FROM debit_notes dn WHERE dn.procurement_id = p.id), 0)) AS order_total,
           p.amount_paid AS order_paid,
-          p.amount_due AS order_due,
+          GREATEST(0, (p.total_amount - COALESCE((SELECT SUM(dn.total_amount) FROM debit_notes dn WHERE dn.procurement_id = p.id), 0)) - COALESCE(p.amount_paid, 0)) AS order_due,
           'vendor_payment' AS type
         FROM payments_log pl
         JOIN procurements p ON p.id = pl.related_id
@@ -2094,6 +2118,79 @@ router.post(['/orders/:id/action', '/portal/orders/:id/action'], requireUniversa
           new_status: newStatus,
           dispatch_tracking_ref: effectiveTracking
         });
+      } else if (action === 'accept_return') {
+        const rrRes = await tenantDb.query(
+          `SELECT id, reference_id, request_type, status FROM return_requests WHERE reference_id = ? AND request_type = 'purchase_return' AND status = 'Pending' AND vendor_id IN (${vPlaceholders}) ORDER BY created_at DESC LIMIT 1`,
+          [id, ...matchedVendorIds]
+        );
+        if (rrRes.rowCount > 0) {
+          const client = await tenantDb.connect();
+          try {
+            await client.query('START TRANSACTION');
+            await executeApproveReturnRequest(
+              client,
+              rrRes.rows[0].id,
+              globalUser.id,
+              (formattedNotes || 'Return accepted by vendor').trim()
+            );
+            await client.query(
+              `UPDATE procurements SET status = 'Return Accepted by Vendor', updated_at = NOW() WHERE id = ? AND vendor_id IN (${vPlaceholders}) AND deleted_at IS NULL`,
+              [id, ...matchedVendorIds]
+            );
+            await client.query('COMMIT');
+          } catch (e) {
+            await client.query('ROLLBACK').catch(() => {});
+            throw e;
+          } finally {
+            client.release();
+          }
+          await insertSystemMessage(
+            tenantDb, rrRes.rows[0].id,
+            `✅ Vendor has Approved this return request. The chat is now closed and debit note is issued.`
+          );
+        } else {
+          await tenantDb.query(
+            `UPDATE procurements SET status = 'Return Accepted by Vendor', updated_at = NOW() WHERE id = ? AND vendor_id IN (${vPlaceholders}) AND deleted_at IS NULL`,
+            [id, ...matchedVendorIds]
+          );
+        }
+
+        await createNotification(tenantDb, {
+          user_type: 'user',
+          title: 'Return Request Accepted by Vendor',
+          message: `Vendor has accepted the return request for Order ${orderRow.procurement_number || id}. Debit note issued and raw material inventory reduced.`,
+          link: '/procurement'
+        }).catch(() => {});
+
+        return res.json({ ok: true, message: 'Return request accepted and confirmed by vendor.', new_status: 'Return Accepted by Vendor' });
+      } else if (action === 'reject_return') {
+        const cleanReason = (reason || formattedNotes || 'Return rejected by vendor').trim();
+        const rrRes = await tenantDb.query(
+          `SELECT id FROM return_requests WHERE reference_id = ? AND request_type = 'purchase_return' AND status = 'Pending' AND vendor_id IN (${vPlaceholders}) ORDER BY created_at DESC LIMIT 1`,
+          [id, ...matchedVendorIds]
+        );
+        if (rrRes.rowCount > 0) {
+          await tenantDb.query(
+            `UPDATE return_requests SET status = 'Rejected', review_notes = ?, reviewed_by = ?, reviewed_at = NOW(), updated_at = NOW() WHERE id = ?`,
+            [cleanReason, globalUser.id, rrRes.rows[0].id]
+          );
+          await insertSystemMessage(
+            tenantDb, rrRes.rows[0].id,
+            `❌ Vendor has Rejected this return request. Reason: ${cleanReason}`
+          );
+        }
+        await tenantDb.query(
+          `UPDATE procurements SET status = 'Return Rejected by Vendor', rejection_reason = ?, updated_at = NOW() WHERE id = ? AND vendor_id IN (${vPlaceholders}) AND deleted_at IS NULL`,
+          [cleanReason, id, ...matchedVendorIds]
+        );
+        await createNotification(tenantDb, {
+          user_type: 'user',
+          title: 'Return Request Declined by Vendor',
+          message: `Vendor declined the return request for Order ${orderRow.procurement_number || id}. Reason: ${cleanReason}`,
+          link: '/procurement'
+        }).catch(() => {});
+
+        return res.json({ ok: true, message: 'Return request declined.', new_status: 'Return Rejected by Vendor' });
       }
     } else {
       // Customer Actions
@@ -2189,6 +2286,66 @@ router.post(['/orders/:id/action', '/portal/orders/:id/action'], requireUniversa
           new_status: newStatus,
           request_number: reqNum
         });
+      } else if (action === 'accept_refund' || action === 'confirm_refund') {
+        const cnRes = await tenantDb.query(
+          'SELECT COALESCE(SUM(total_amount), 0) AS credit_note_total FROM credit_notes WHERE sale_id = ?',
+          [id]
+        );
+        const creditNoteTotal = Number(cnRes.rows[0]?.credit_note_total || 0);
+        const saleRow = sRes.rows[0];
+        const fin = getSaleFinancials(saleRow, creditNoteTotal);
+        const refundDue = fin.amount_to_return;
+
+        if (refundDue <= 0.009) {
+          return res.status(400).json({ error: 'This order has no pending refund due balance.' });
+        }
+
+        const refundAmt = Number(req.body.amount || req.body.refund_amount || refundDue);
+        if (refundAmt > refundDue + 0.01) {
+          return res.status(400).json({ error: `Refund amount cannot exceed pending refund due of ₹${refundDue.toFixed(2)}` });
+        }
+
+        // Deduct the refunded amount from workspace sales ledger
+        const newReceived = Math.max(0, Number((fin.amount_received - refundAmt).toFixed(2)));
+        const newDue = Math.max(0, Number((fin.net_total - newReceived).toFixed(2)));
+        let newStatus = (fin.net_total === 0) ? 'Returned' : 'Partially Returned';
+
+        await tenantDb.query(
+          `UPDATE sales 
+           SET total_amount = ?, amount_received = ?, amount_due = ?, status = ?, updated_at = NOW() 
+           WHERE id = ?`,
+          [fin.original_total, newReceived, newDue, newStatus, id]
+        );
+
+        // Record negative payment entry in payments_log
+        const payId = crypto.randomUUID();
+        const refundNotes = `Customer Refund Completed: ${req.body.notes || 'Refund of returned items settled and accepted by customer'}`;
+        await tenantDb.query(
+          `INSERT INTO payments_log (id, related_type, related_id, amount, date, notes, created_by)
+           VALUES (?, 'sale', ?, ?, NOW(), ?, ?)`,
+          [payId, id, -refundAmt, refundNotes, globalUser.id]
+        );
+
+        // Update credit note status to Refunded
+        await tenantDb.query(
+          "UPDATE credit_notes SET status = 'Refunded', updated_at = NOW() WHERE sale_id = ?",
+          [id]
+        ).catch(() => {});
+
+        const custInfo = cMatch.rows[0]?.name || globalUser.name || 'Customer';
+        await createNotification(tenantDb, {
+          user_type: 'user',
+          title: 'Customer Refund Completed & Settled',
+          message: `${custInfo} has accepted and completed the refund of ₹${refundAmt.toFixed(2)} for Order ${saleRow.invoice_number || id}. Deducted from sales ledger.`,
+          link: '/sales'
+        }).catch(() => {});
+
+        return res.json({
+          ok: true,
+          message: `Refund of ₹${refundAmt.toFixed(2)} completed successfully! Deducted from workspace balance.`,
+          new_status: newStatus,
+          refunded_amount: refundAmt
+        });
       }
     }
 
@@ -2234,8 +2391,18 @@ router.get(['/returns', '/portal/returns'], requireUniversalPortalAuth, async (r
       where += ' AND rr.customer_id = ?';
       params.push(activeMem.entity_id);
     } else {
-      where += ' AND rr.vendor_id = ?';
-      params.push(activeMem.entity_id);
+      const vMatch = await tenantDb.query(
+        `SELECT id FROM vendors 
+         WHERE id = ? 
+            OR global_user_id = ? 
+            OR (email IS NOT NULL AND LOWER(email) = LOWER(?))
+            OR (phone IS NOT NULL AND phone != '' AND phone = ?)`,
+        [activeMem.entity_id, globalUser.id, globalUser.email, globalUser.phone || '']
+      );
+      const matchedVendorIds = Array.from(new Set([activeMem.entity_id, ...vMatch.rows.map(r => r.id)].filter(Boolean)));
+      const vPlaceholders = matchedVendorIds.map(() => '?').join(',');
+      where += ` AND rr.vendor_id IN (${vPlaceholders})`;
+      params.push(...matchedVendorIds);
     }
 
     if (status && status !== 'all') {
@@ -2359,9 +2526,21 @@ router.post(['/returns/:id/accept', '/portal/returns/:id/accept'], requireUniver
     const membership = membershipRes.rows[0];
     if (!membership || membership.portal_type !== 'vendor') return res.status(403).json({ error: 'Vendor portal access is required' });
     const tenantDb = getTenantPool(membership.database_name);
+
+    const vMatch = await tenantDb.query(
+      `SELECT id FROM vendors 
+       WHERE id = ? 
+          OR global_user_id = ? 
+          OR (email IS NOT NULL AND LOWER(email) = LOWER(?))
+          OR (phone IS NOT NULL AND phone != '' AND phone = ?)`,
+      [membership.entity_id, req.portalUser.id, req.portalUser.email, req.portalUser.phone || '']
+    );
+    const matchedVendorIds = Array.from(new Set([membership.entity_id, ...vMatch.rows.map(r => r.id)].filter(Boolean)));
+    const vPlaceholders = matchedVendorIds.map(() => '?').join(',');
+
     const requestRes = await tenantDb.query(
-      `SELECT id, reference_id, request_type, status FROM return_requests WHERE id = ? AND vendor_id = ?`,
-      [req.params.id, membership.entity_id]
+      `SELECT id, reference_id, request_type, status, request_number FROM return_requests WHERE id = ? AND vendor_id IN (${vPlaceholders})`,
+      [req.params.id, ...matchedVendorIds]
     );
     const returnRequest = requestRes.rows[0];
     if (!returnRequest) return res.status(404).json({ error: 'Return request not found' });
@@ -2378,8 +2557,8 @@ router.post(['/returns/:id/accept', '/portal/returns/:id/accept'], requireUniver
         (notes || 'Accepted by vendor').trim()
       );
       await client.query(
-        "UPDATE procurements SET status = 'Return Accepted by Vendor', updated_at = NOW() WHERE id = ? AND vendor_id = ? AND deleted_at IS NULL",
-        [returnRequest.reference_id, membership.entity_id]
+        `UPDATE procurements SET status = 'Return Accepted by Vendor', updated_at = NOW() WHERE id = ? AND vendor_id IN (${vPlaceholders}) AND deleted_at IS NULL`,
+        [returnRequest.reference_id, ...matchedVendorIds]
       );
       await client.query('COMMIT');
     } catch (err) {
@@ -2392,10 +2571,17 @@ router.post(['/returns/:id/accept', '/portal/returns/:id/accept'], requireUniver
     // Auto-close chat
     await insertSystemMessage(
       tenantDb, returnRequest.id,
-      `✅ Vendor has Approved this return request. ${notes ? `Notes: ${notes.trim()}` : ''} The chat is now closed and contact information is available.`
+      `✅ Vendor has Approved this return request. ${notes ? `Notes: ${notes.trim()}` : ''} The chat is now closed and debit note is issued.`
     );
 
-    return res.json({ ok: true, message: 'Return request accepted and inventory updated', status: 'Approved', procurement_status: 'Return Accepted by Vendor' });
+    await createNotification(tenantDb, {
+      user_type: 'user',
+      title: 'Return Request Accepted by Vendor',
+      message: `Vendor accepted the return request (${returnRequest.request_number || returnRequest.id}). Debit note issued and raw material inventory reduced.`,
+      link: '/procurement'
+    }).catch(() => {});
+
+    return res.json({ ok: true, message: 'Return request accepted, debit note issued, and inventory updated', status: 'Approved', procurement_status: 'Return Accepted by Vendor' });
   } catch (err) {
     console.error('vendor portal return acceptance error:', err);
     return res.status(500).json({ error: 'Failed to accept return request' });
@@ -2414,9 +2600,21 @@ router.post(['/returns/:id/reject', '/portal/returns/:id/reject'], requireUniver
     const membership = membershipRes.rows[0];
     if (!membership || membership.portal_type !== 'vendor') return res.status(403).json({ error: 'Vendor portal access is required' });
     const tenantDb = getTenantPool(membership.database_name);
+
+    const vMatch = await tenantDb.query(
+      `SELECT id FROM vendors 
+       WHERE id = ? 
+          OR global_user_id = ? 
+          OR (email IS NOT NULL AND LOWER(email) = LOWER(?))
+          OR (phone IS NOT NULL AND phone != '' AND phone = ?)`,
+      [membership.entity_id, req.portalUser.id, req.portalUser.email, req.portalUser.phone || '']
+    );
+    const matchedVendorIds = Array.from(new Set([membership.entity_id, ...vMatch.rows.map(r => r.id)].filter(Boolean)));
+    const vPlaceholders = matchedVendorIds.map(() => '?').join(',');
+
     const requestRes = await tenantDb.query(
-      `SELECT id, reference_id, request_type, status FROM return_requests WHERE id = ? AND vendor_id = ?`,
-      [req.params.id, membership.entity_id]
+      `SELECT id, reference_id, request_type, status, request_number FROM return_requests WHERE id = ? AND vendor_id IN (${vPlaceholders})`,
+      [req.params.id, ...matchedVendorIds]
     );
     const returnRequest = requestRes.rows[0];
     if (!returnRequest) return res.status(404).json({ error: 'Return request not found' });
@@ -2425,13 +2623,20 @@ router.post(['/returns/:id/reject', '/portal/returns/:id/reject'], requireUniver
 
     const cleanReason = String(reason).trim();
     await tenantDb.query(`UPDATE return_requests SET status = 'Rejected', review_notes = ?, reviewed_at = NOW(), updated_at = NOW() WHERE id = ? AND status = 'Pending'`, [cleanReason, returnRequest.id]);
-    await tenantDb.query("UPDATE procurements SET status = 'Return Rejected by Vendor', rejection_reason = ?, updated_at = NOW() WHERE id = ? AND vendor_id = ? AND deleted_at IS NULL", [cleanReason, returnRequest.reference_id, membership.entity_id]);
+    await tenantDb.query(`UPDATE procurements SET status = 'Return Rejected by Vendor', rejection_reason = ?, updated_at = NOW() WHERE id = ? AND vendor_id IN (${vPlaceholders}) AND deleted_at IS NULL`, [cleanReason, returnRequest.reference_id, ...matchedVendorIds]);
 
     // Auto-close chat
     await insertSystemMessage(
       tenantDb, returnRequest.id,
       `❌ Vendor has Rejected this return request. Reason: ${cleanReason} The chat is now closed.`
     );
+
+    await createNotification(tenantDb, {
+      user_type: 'user',
+      title: 'Return Request Declined by Vendor',
+      message: `Vendor declined the return request (${returnRequest.request_number || returnRequest.id}). Reason: ${cleanReason}`,
+      link: '/procurement'
+    }).catch(() => {});
 
     return res.json({ ok: true, message: 'Return request rejected', status: 'Rejected', procurement_status: 'Return Rejected by Vendor' });
   } catch (err) {

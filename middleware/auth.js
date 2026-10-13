@@ -80,6 +80,7 @@ async function requireAuth(req, res, next) {
     }
 
     const company = companyRes.rows[0];
+    company.name = company.company_name;
     company.number_system = company.number_system || 'indian';
 
     // Administrative status blocks
@@ -149,7 +150,7 @@ async function requireAuth(req, res, next) {
 
     // Check inactive / suspended
     if (row.status === 'inactive' || row.status === 'suspended') {
-      return res.status(403).json({ error: 'Account is deactivated or suspended' });
+      return res.status(403).json({ error: 'Ask owner to activate your account.' });
     }
 
     const userRoles = resolveUserRoles(row.role, row.roles);

@@ -161,10 +161,37 @@ router.get('/', requireAuth, requirePermission('sales', 'view'), async (req, res
   }
 });
 
-// List Credit Notes (Returns)
-router.get('/credit-notes', requireAuth, requirePermission('returns', 'view'), async (req, res) => {
+// Helper for credit notes view permission (accessible via either sales or returns permission)
+const requireSalesOrReturnsView = async (req, res, next) => {
+  if (!req.user) return res.status(401).json({ error: 'Missing auth' });
+  const userRoles = req.user.roles && Array.isArray(req.user.roles) && req.user.roles.length > 0
+    ? req.user.roles
+    : [req.user.role || 'accounts'];
+
+  if (userRoles.includes('owner') || userRoles.includes('admin') || req.user.role === 'owner' || req.user.role === 'admin' || req.user.role === 'customer') {
+    return next();
+  }
+
   try {
-    await req.tenantDb.query(`
+    const placeholders = userRoles.map(() => '?').join(',');
+    const permRes = await req.tenantDb.query(
+      `SELECT MAX(can_view) AS allowed FROM role_permissions WHERE role IN (${placeholders}) AND module IN ('sales', 'returns')`,
+      [...userRoles]
+    );
+    const isAllowed = Number(permRes.rows[0]?.allowed) === 1 || permRes.rows[0]?.allowed === true;
+    if (!isAllowed) {
+      return res.status(403).json({ error: "Forbidden: assigned roles do not have view permission for sales or returns" });
+    }
+    return next();
+  } catch (err) {
+    return next();
+  }
+};
+
+// Helper to ensure credit_notes table and all columns exist in tenant DB
+async function ensureCreditNotesSchema(tenantDb) {
+  try {
+    await tenantDb.query(`
       CREATE TABLE IF NOT EXISTS credit_notes (
         id VARCHAR(36) PRIMARY KEY,
         credit_note_number VARCHAR(50) NOT NULL,
@@ -174,13 +201,41 @@ router.get('/credit-notes', requireAuth, requirePermission('returns', 'view'), a
         total_amount DECIMAL(12,2) NOT NULL DEFAULT '0.00',
         status VARCHAR(30) NOT NULL DEFAULT 'Issued',
         created_by VARCHAR(36) NULL,
+        notes TEXT NULL,
+        date DATE NULL,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       )
     `).catch(() => {});
 
+    await tenantDb.query('ALTER TABLE credit_notes ADD COLUMN created_by VARCHAR(36) NULL').catch(() => {});
+    await tenantDb.query('ALTER TABLE credit_notes ADD COLUMN notes TEXT NULL').catch(() => {});
+    await tenantDb.query('ALTER TABLE credit_notes ADD COLUMN date DATE NULL').catch(() => {});
+    await tenantDb.query('ALTER TABLE credit_notes ADD COLUMN status VARCHAR(30) NOT NULL DEFAULT "Issued"').catch(() => {});
+
+    await tenantDb.query(`
+      CREATE TABLE IF NOT EXISTS credit_note_items (
+        id VARCHAR(36) PRIMARY KEY,
+        credit_note_id VARCHAR(36) NOT NULL,
+        finished_good_id VARCHAR(36) NULL,
+        quantity DECIMAL(12,2) NOT NULL DEFAULT '0.00',
+        rate_per_unit DECIMAL(12,2) NOT NULL DEFAULT '0.00',
+        line_total DECIMAL(12,2) NOT NULL DEFAULT '0.00',
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `).catch(() => {});
+  } catch (e) {
+    // ignore
+  }
+}
+
+// List Credit Notes (Returns & Sales)
+router.get('/credit-notes', requireAuth, requireSalesOrReturnsView, async (req, res) => {
+  try {
+    await ensureCreditNotesSchema(req.tenantDb);
+
     const page = Math.max(parseInt(req.query.page || '1', 10), 1);
-    const pageSize = Math.min(parseInt(req.query.page_size || req.query.limit || '20', 10), 200);
+    const pageSize = Math.min(parseInt(req.query.page_size || req.query.limit || '20', 10), 10000);
     const offset = (page - 1) * pageSize;
     const search = req.query.search || '';
 
@@ -249,23 +304,7 @@ router.post('/credit-notes', requireAuth, requirePermission('sales', 'create'), 
   if (!reason || !String(reason).trim()) return res.status(400).json({ error: 'Reason for credit note is required' });
 
   try {
-    // Ensure credit_notes table exists
-    await req.tenantDb.query(`
-      CREATE TABLE IF NOT EXISTS credit_notes (
-        id VARCHAR(36) PRIMARY KEY,
-        credit_note_number VARCHAR(50) NOT NULL,
-        customer_id VARCHAR(36) NOT NULL,
-        sale_id VARCHAR(36) NULL,
-        reason VARCHAR(255) NULL,
-        total_amount DECIMAL(12,2) NOT NULL DEFAULT '0.00',
-        status VARCHAR(30) NOT NULL DEFAULT 'Issued',
-        created_by VARCHAR(36) NULL,
-        notes TEXT NULL,
-        date DATE NULL,
-        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-      )
-    `).catch(() => {});
+    await ensureCreditNotesSchema(req.tenantDb);
 
     const creditNoteNumber = await getNextDocumentNumber(req.tenantDb, 'credit_note');
     const id = crypto.randomUUID();
@@ -326,6 +365,163 @@ router.post('/credit-notes', requireAuth, requirePermission('sales', 'create'), 
   } catch (err) {
     console.error('create credit note error', err);
     return res.status(500).json({ error: 'Failed to create credit note: ' + err.message });
+  }
+});
+
+// Single Credit Note Detail
+router.get('/credit-notes/:id', requireAuth, requireSalesOrReturnsView, async (req, res) => {
+  try {
+    await ensureCreditNotesSchema(req.tenantDb);
+
+    const cnRes = await req.tenantDb.query(
+      `SELECT cn.*,
+              c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone, c.gstin AS customer_gstin,
+              s.invoice_number AS sale_invoice_number, s.date AS sale_invoice_date, s.total_amount AS sale_total_amount,
+              s.payment_status AS sale_payment_status
+       FROM credit_notes cn
+       LEFT JOIN customers c ON c.id = cn.customer_id
+       LEFT JOIN sales s ON s.id = cn.sale_id
+       WHERE cn.id = ?`,
+      [req.params.id]
+    );
+
+    if (cnRes.rowCount === 0) {
+      return res.status(404).json({ error: 'Credit note not found' });
+    }
+
+    const cn = cnRes.rows[0];
+
+    // Safely lookup creator name without requiring created_by column in the main join
+    if (cn.created_by) {
+      const uRes = await req.tenantDb.query('SELECT name FROM users WHERE id = ?', [cn.created_by]).catch(() => ({ rows: [] }));
+      cn.created_by_name = uRes.rows[0]?.name || null;
+    }
+
+    // Scoping check for customer role
+    if ((req.user.role === 'customer' || req.user.customer_id) && cn.customer_id && req.user.customer_id && cn.customer_id !== req.user.customer_id) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Line items
+    let items = [];
+    const itemsRes = await req.tenantDb.query(
+      `SELECT cni.*, 
+              COALESCE(fg.name, 'Finished Product') AS item_name,
+              fg.sku, fg.hsn_code, fg.unit
+       FROM credit_note_items cni
+       LEFT JOIN finished_goods fg ON fg.id = cni.finished_good_id
+       WHERE cni.credit_note_id = ?`,
+      [cn.id]
+    ).catch(() => ({ rows: [] }));
+
+    if (itemsRes.rows && itemsRes.rows.length > 0) {
+      items = itemsRes.rows.map((it) => ({
+        ...it,
+        name: it.item_name,
+        quantity: Number(it.quantity || 0),
+        rate_per_unit: Number(it.rate_per_unit || 0),
+        line_total: Number(it.line_total || (Number(it.quantity || 0) * Number(it.rate_per_unit || 0)))
+      }));
+    } else {
+      const ledgerRes = await req.tenantDb.query(
+        `SELECT il.*,
+                COALESCE(fg.name, 'Finished Product') AS item_name,
+                fg.sku, fg.hsn_code, fg.unit
+         FROM inventory_ledger il
+         LEFT JOIN finished_goods fg ON fg.id = il.item_id
+         WHERE il.reference_table = 'credit_notes' AND il.reference_id = ?`,
+        [cn.id]
+      ).catch(() => ({ rows: [] }));
+
+      if (ledgerRes.rows && ledgerRes.rows.length > 0) {
+        items = ledgerRes.rows.map((it) => ({
+          id: it.id,
+          name: it.item_name,
+          item_name: it.item_name,
+          quantity: Number(it.quantity || 0),
+          rate_per_unit: Number(cn.total_amount || 0) / (Number(it.quantity) || 1),
+          line_total: Number(cn.total_amount || 0),
+          unit: it.unit || 'pcs'
+        }));
+      } else if (cn.sale_id) {
+        const saleItemsRes = await req.tenantDb.query(
+          `SELECT si.*,
+                  COALESCE(fg.name, si.name, 'Finished Product') AS item_name,
+                  fg.sku, fg.hsn_code, fg.unit
+           FROM sale_items si
+           LEFT JOIN finished_goods fg ON fg.id = si.finished_good_id
+           WHERE si.sale_id = ?`,
+          [cn.sale_id]
+        ).catch(() => ({ rows: [] }));
+
+        if (saleItemsRes.rows && saleItemsRes.rows.length > 0) {
+          items = saleItemsRes.rows.map((it) => ({
+            ...it,
+            name: it.item_name,
+            quantity: Number(it.quantity || 0),
+            rate_per_unit: Number(it.rate_per_unit || 0),
+            line_total: Number(it.line_total || 0)
+          }));
+        }
+      }
+    }
+
+    cn.items = items;
+
+    // Timeline entries
+    const timeline = [
+      {
+        id: 'cn-issued',
+        kind: 'credit_note',
+        title: 'Credit Note Issued',
+        date: cn.date || cn.created_at,
+        created_at: cn.created_at,
+        notes: cn.reason ? `Reason: ${cn.reason}` : 'Credit note issued against customer balance',
+        amount: Number(cn.total_amount || 0)
+      }
+    ];
+
+    if (cn.sale_invoice_number) {
+      timeline.unshift({
+        id: 'sale-linked',
+        kind: 'sales_invoice',
+        title: 'Original Sales Invoice',
+        date: cn.sale_invoice_date || cn.created_at,
+        created_at: cn.sale_invoice_date || cn.created_at,
+        notes: `Linked to Tax Invoice ${cn.sale_invoice_number}`
+      });
+    }
+
+    if (cn.status === 'Refunded') {
+      timeline.push({
+        id: 'cn-refunded',
+        kind: 'refund',
+        title: 'Refund Disbursed',
+        date: cn.updated_at || cn.created_at,
+        created_at: cn.updated_at || cn.created_at,
+        notes: 'Credit amount refunded or disbursed to customer',
+        amount: Number(cn.total_amount || 0)
+      });
+    }
+
+    cn.timeline = timeline;
+
+    return res.json(cn);
+  } catch (err) {
+    console.error('get credit note error', err);
+    return res.status(500).json({ error: 'Failed to fetch credit note: ' + err.message });
+  }
+});
+
+// Delete Credit Note
+router.delete('/credit-notes/:id', requireAuth, requirePermission('sales', 'delete'), async (req, res) => {
+  try {
+    const cnRes = await req.tenantDb.query('SELECT * FROM credit_notes WHERE id = ?', [req.params.id]);
+    if (cnRes.rowCount === 0) return res.status(404).json({ error: 'Credit note not found' });
+    await req.tenantDb.query('DELETE FROM credit_notes WHERE id = ?', [req.params.id]);
+    return res.json({ message: 'Credit note deleted successfully' });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to delete credit note: ' + err.message });
   }
 });
 
@@ -684,11 +880,16 @@ router.post('/', requireAuth, requirePermission('sales', 'create'), async (req, 
     });
 
     const received = Math.max(0, numeric(amount_received));
+    if (received > totals.total_amount + 0.001) {
+      return res.status(400).json({
+        error: `Amount received now (${received}) cannot be higher than the overall total of the bill generated (${totals.total_amount})`
+      });
+    }
     const due = Math.max(0, totals.total_amount - received);
     const paymentStatus = due <= 0.01 ? 'Paid' : (received > 0 ? 'Partially Paid' : 'Unpaid');
 
     const invoiceNumber = await getNextDocumentNumber(req.tenantDb, 'invoice');
-    const initialStatus = send_to_customer ? 'Sales Order Sent' : 'Draft';
+    const initialStatus = send_to_customer ? 'Sales Order Sent' : (customer_id ? 'Ordered' : 'Draft');
 
     await req.tenantDb.query('START TRANSACTION');
     const saleId = crypto.randomUUID();
@@ -726,18 +927,8 @@ router.post('/', requireAuth, requirePermission('sales', 'create'), async (req, 
           line.igst_rate, line.igst_amount, line.line_total
         ]
       );
-
-      // Direct sales invoice creation immediately deducts finished goods inventory in base units with packaging breakdown
-      if (!send_to_customer) {
-        const baseDeductQty = Number(line.quantity) * (Number(line.units_per_package) || 1);
-        const ledgerId = crypto.randomUUID();
-        await req.tenantDb.query(
-          `INSERT INTO inventory_ledger (
-            id, item_type, item_id, location_id, packaging_level_id, package_count, transaction_type, quantity, unit_cost, reason, reference_table, reference_id, created_by
-          ) VALUES (?, 'finished_good', ?, ?, ?, ?, 'out', ?, ?, ?, 'sales', ?, ?)`,
-          [ledgerId, line.finished_good_id, targetLocationId, line.packaging_level_id || null, Number(line.quantity), baseDeductQty, line.rate_per_unit, `Sales Invoice ${invoiceNumber}`, saleId, req.user.id]
-        );
-      }
+      // Note: Finished goods inventory is NOT deducted upon order placement;
+      // it is deducted when workspace dispatches the shipment via POST /api/invoices/:id/dispatch.
     }
 
     if (received > 0) {
@@ -1114,6 +1305,91 @@ router.post('/:id/payments', requireAuth, async (req, res) => {
     await req.tenantDb.query('ROLLBACK').catch(() => {});
     console.error('record invoice payment error', err);
     return res.status(500).json({ error: 'Failed to record payment: ' + err.message });
+  }
+});
+
+// POST Record Customer Refund for Invoice (when amount_to_return > 0)
+router.post('/:id/refund', requireAuth, async (req, res) => {
+  const { amount, date, notes, reference } = req.body;
+  const refundAmt = numeric(amount);
+  if (!refundAmt || refundAmt <= 0) return res.status(400).json({ error: 'Please enter a valid positive refund amount' });
+
+  try {
+    await req.tenantDb.query('START TRANSACTION');
+    const saleRes = await req.tenantDb.query('SELECT * FROM sales WHERE id = ? AND deleted_at IS NULL FOR UPDATE', [req.params.id]);
+    if (saleRes.rowCount === 0) {
+      await req.tenantDb.query('ROLLBACK');
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+    const sale = saleRes.rows[0];
+    const cnRes = await req.tenantDb.query('SELECT COALESCE(SUM(total_amount), 0) AS credit_note_total FROM credit_notes WHERE sale_id = ?', [req.params.id]);
+    const creditNoteTotal = Number(cnRes.rows[0]?.credit_note_total || 0);
+    const fin = getSaleFinancials(sale, creditNoteTotal);
+    const refundDue = fin.amount_to_return;
+
+    if (refundDue <= 0.009) {
+      await req.tenantDb.query('ROLLBACK');
+      return res.status(400).json({ error: 'This invoice has no refund due balance for the customer.' });
+    }
+
+    if (refundAmt > refundDue + 0.01) {
+      await req.tenantDb.query('ROLLBACK');
+      return res.status(400).json({ error: `Refund amount cannot exceed pending refund due of ₹${refundDue.toFixed(2)}` });
+    }
+
+    // Adjust amount_received by subtracting the refunded amount
+    const newReceived = Math.max(0, Number((fin.amount_received - refundAmt).toFixed(2)));
+    const newDue = Math.max(0, Number((fin.net_total - newReceived).toFixed(2)));
+
+    let newStatus = sale.status;
+    if (fin.net_total === 0 && (newReceived === 0 || refundAmt >= refundDue - 0.01)) {
+      newStatus = 'Returned';
+    } else if (sale.status === 'Return Requested') {
+      newStatus = (fin.net_total === 0) ? 'Returned' : 'Partially Returned';
+    }
+
+    await req.tenantDb.query(
+      `UPDATE sales
+       SET total_amount = ?, amount_received = ?, amount_due = ?, status = ?, updated_at = NOW()
+       WHERE id = ?`,
+      [fin.original_total, newReceived, newDue, newStatus, req.params.id]
+    );
+
+    // Record refund receipt in payments_log
+    const payId = crypto.randomUUID();
+    const payDate = date ? `${date} 12:00:00` : new Date();
+    const refString = reference ? `[${reference}] ` : '';
+    const refundNotes = `Customer Refund Paid: ${refString}${notes || 'Refund of returned items paid to customer'}`;
+    await req.tenantDb.query(
+      `INSERT INTO payments_log (id, related_type, related_id, amount, date, notes, created_by)
+       VALUES (?, 'sale', ?, ?, ?, ?, ?)`,
+      [payId, req.params.id, -refundAmt, payDate, refundNotes, req.user.id]
+    );
+
+    // Update credit notes status to 'Refunded'
+    await req.tenantDb.query(
+      "UPDATE credit_notes SET status = 'Refunded', updated_at = NOW() WHERE sale_id = ?",
+      [req.params.id]
+    ).catch(() => {});
+
+    await req.tenantDb.query('COMMIT');
+
+    const updatedSaleRes = await req.tenantDb.query('SELECT * FROM sales WHERE id = ?', [req.params.id]);
+    const paymentsRes = await req.tenantDb.query(
+      'SELECT * FROM payments_log WHERE related_id = ? AND deleted_at IS NULL ORDER BY date DESC, created_at DESC',
+      [req.params.id]
+    );
+
+    return res.json({
+      ok: true,
+      message: 'Customer refund recorded successfully',
+      sale: updatedSaleRes.rows[0],
+      payments: paymentsRes.rows
+    });
+  } catch (err) {
+    await req.tenantDb.query('ROLLBACK').catch(() => {});
+    console.error('record invoice refund error', err);
+    return res.status(500).json({ error: 'Failed to record refund: ' + err.message });
   }
 });
 

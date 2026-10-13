@@ -310,60 +310,118 @@ async function checkGstinAndPanUniqueness({ tenantDb, currentId, gstin, pan, par
   return null;
 }
 
-// Ensures global email alignment for a given GSTIN to maintain unified partner portal space
+// Ensures global email and GSTIN alignment for a given party to maintain unified partner portal space
 async function checkGlobalGstinEmailAlignment({ gstin, email, partyType = 'vendor' }) {
   const cleanGstin = gstin && typeof gstin === 'string' && gstin.trim() ? gstin.trim().toUpperCase() : null;
-  if (!cleanGstin) return null;
-
   const enteredEmail = email && typeof email === 'string' && email.trim() ? email.trim().toLowerCase() : null;
+  if (!cleanGstin && !enteredEmail) return null;
 
-  let registeredEmail = null;
+  const table = partyType === 'customer' ? 'customers' : 'vendors';
+  const typeLabel = partyType === 'customer' ? 'Customer' : 'Vendor';
 
-  // 1. Check global_portal_users in masterDb
-  try {
-    const gpuRes = await queryMaster(
-      `SELECT email, name, company_name FROM global_portal_users 
-       WHERE UPPER(TRIM(gstin)) = ? AND email IS NOT NULL AND TRIM(email) != '' LIMIT 1`,
-      [cleanGstin]
-    );
-    if (gpuRes.rows && gpuRes.rows.length > 0 && gpuRes.rows[0].email) {
-      registeredEmail = gpuRes.rows[0].email.trim().toLowerCase();
-    }
-  } catch (err) {
-    console.error('checkGlobalGstinEmailAlignment master query error:', err);
-  }
+  // 1. If GSTIN is entered, enforce that email matches any existing platform registration for this GSTIN
+  if (cleanGstin) {
+    let registeredEmail = null;
 
-  // 2. If not found in global_portal_users, check across active tenant databases
-  if (!registeredEmail) {
+    // Check global_portal_users in masterDb matching partyType
     try {
-      const compRes = await queryMaster("SELECT database_name FROM companies WHERE status = 'active'");
-      const tenantDbs = (compRes.rows || []).map((c) => c.database_name).filter(Boolean);
-      const table = partyType === 'customer' ? 'customers' : 'vendors';
-
-      for (const dbName of tenantDbs) {
-        try {
-          const tDb = getTenantPool(dbName);
-          const tRes = await tDb.query(
-            `SELECT email FROM ${table} 
-             WHERE UPPER(TRIM(gstin)) = ? AND email IS NOT NULL AND TRIM(email) != '' AND deleted_at IS NULL LIMIT 1`,
-            [cleanGstin]
-          );
-          if (tRes.rows && tRes.rows.length > 0 && tRes.rows[0].email) {
-            registeredEmail = tRes.rows[0].email.trim().toLowerCase();
-            break;
-          }
-        } catch (_) {}
+      const gpuRes = await queryMaster(
+        `SELECT gpu.email, gpu.name, gpu.company_name 
+         FROM global_portal_users gpu
+         LEFT JOIN global_portal_memberships gpm ON gpm.global_user_id = gpu.id
+         WHERE UPPER(TRIM(gpu.gstin)) = ? AND gpu.email IS NOT NULL AND TRIM(gpu.email) != ''
+           AND (gpm.portal_type = ? OR gpm.portal_type IS NULL) LIMIT 1`,
+        [cleanGstin, partyType]
+      );
+      if (gpuRes.rows && gpuRes.rows.length > 0 && gpuRes.rows[0].email) {
+        registeredEmail = gpuRes.rows[0].email.trim().toLowerCase();
       }
     } catch (err) {
-      console.error('checkGlobalGstinEmailAlignment tenant scan error:', err);
+      console.error('checkGlobalGstinEmailAlignment master query error:', err);
+    }
+
+    // Check across active tenant databases
+    if (!registeredEmail) {
+      try {
+        const compRes = await queryMaster("SELECT database_name FROM companies WHERE status = 'active'");
+        const tenantDbs = (compRes.rows || []).map((c) => c.database_name).filter(Boolean);
+
+        for (const dbName of tenantDbs) {
+          try {
+            const tDb = getTenantPool(dbName);
+            const tRes = await tDb.query(
+              `SELECT email FROM ${table} 
+               WHERE UPPER(TRIM(gstin)) = ? AND email IS NOT NULL AND TRIM(email) != '' AND deleted_at IS NULL LIMIT 1`,
+              [cleanGstin]
+            );
+            if (tRes.rows && tRes.rows.length > 0 && tRes.rows[0].email) {
+              registeredEmail = tRes.rows[0].email.trim().toLowerCase();
+              break;
+            }
+          } catch (_) {}
+        }
+      } catch (err) {
+        console.error('checkGlobalGstinEmailAlignment tenant scan error:', err);
+      }
+    }
+
+    if (registeredEmail) {
+      if (!enteredEmail || enteredEmail !== registeredEmail) {
+        return `${typeLabel} with GSTIN "${cleanGstin}" is already registered on the platform with email "${registeredEmail}". Please use "${registeredEmail}" to ensure unified partner portal access.`;
+      }
     }
   }
 
-  // 3. If a registered email exists for this GSTIN, enforce that the entered email matches
-  if (registeredEmail) {
-    if (!enteredEmail || enteredEmail !== registeredEmail) {
-      const typeLabel = partyType === 'customer' ? 'Customer' : 'Vendor';
-      return `${typeLabel} with GSTIN "${cleanGstin}" is already registered on the platform with email "${registeredEmail}". Please use "${registeredEmail}" to ensure unified partner portal access.`;
+  // 2. If Email is entered, enforce that GSTIN matches any existing platform registration for this Email
+  if (enteredEmail) {
+    let registeredGstin = null;
+
+    // Check global_portal_users
+    try {
+      const gpuRes = await queryMaster(
+        `SELECT gpu.gstin 
+         FROM global_portal_users gpu
+         LEFT JOIN global_portal_memberships gpm ON gpm.global_user_id = gpu.id
+         WHERE LOWER(TRIM(gpu.email)) = ? AND gpu.gstin IS NOT NULL AND TRIM(gpu.gstin) != ''
+           AND (gpm.portal_type = ? OR gpm.portal_type IS NULL) LIMIT 1`,
+        [enteredEmail, partyType]
+      );
+      if (gpuRes.rows && gpuRes.rows.length > 0 && gpuRes.rows[0].gstin) {
+        registeredGstin = gpuRes.rows[0].gstin.trim().toUpperCase();
+      }
+    } catch (err) {
+      console.error('checkGlobalGstinEmailAlignment master query gstin error:', err);
+    }
+
+    // Check across active tenant databases
+    if (!registeredGstin) {
+      try {
+        const compRes = await queryMaster("SELECT database_name FROM companies WHERE status = 'active'");
+        const tenantDbs = (compRes.rows || []).map((c) => c.database_name).filter(Boolean);
+
+        for (const dbName of tenantDbs) {
+          try {
+            const tDb = getTenantPool(dbName);
+            const tRes = await tDb.query(
+              `SELECT gstin FROM ${table} 
+               WHERE LOWER(TRIM(email)) = ? AND gstin IS NOT NULL AND TRIM(gstin) != '' AND deleted_at IS NULL LIMIT 1`,
+              [enteredEmail]
+            );
+            if (tRes.rows && tRes.rows.length > 0 && tRes.rows[0].gstin) {
+              registeredGstin = tRes.rows[0].gstin.trim().toUpperCase();
+              break;
+            }
+          } catch (_) {}
+        }
+      } catch (err) {
+        console.error('checkGlobalGstinEmailAlignment tenant scan gstin error:', err);
+      }
+    }
+
+    if (registeredGstin) {
+      if (!cleanGstin || cleanGstin !== registeredGstin) {
+        return `${typeLabel} with email "${enteredEmail}" is already registered on the platform with GSTIN "${registeredGstin}". Please use GSTIN "${registeredGstin}" to ensure unified partner portal access.`;
+      }
     }
   }
 
@@ -450,6 +508,24 @@ router.post('/vendors', requireAuth, requirePermission('parties', 'create'), asy
         JSON.stringify(contactList)
       ]
     );
+
+    // Auto-link global portal user if already registered on the platform
+    const companyId = req.user?.company_id || req.user?.workspace_id;
+    if (companyId && finalEmail) {
+      try {
+        const guRes = await queryMaster('SELECT id FROM global_portal_users WHERE LOWER(TRIM(email)) = ?', [finalEmail.toLowerCase().trim()]);
+        if (guRes.rows && guRes.rows.length > 0) {
+          const gUserId = guRes.rows[0].id;
+          await queryMaster(
+            `INSERT IGNORE INTO global_portal_memberships (id, global_user_id, company_id, entity_id, portal_type, status, joined_at)
+             VALUES (?, ?, ?, ?, 'vendor', 'Active', NOW())`,
+            [crypto.randomUUID(), gUserId, companyId, id]
+          );
+        }
+      } catch (err) {
+        console.error('Auto-link vendor membership error:', err);
+      }
+    }
 
     const fetched = await req.tenantDb.query('SELECT * FROM vendors WHERE id = ?', [id]);
     return res.status(201).json(parsePartyContacts(fetched.rows[0]));
@@ -1310,6 +1386,24 @@ router.post('/customers', requireAuth, requirePermission('parties', 'create'), a
         JSON.stringify(contactList)
       ]
     );
+
+    // Auto-link global portal user if already registered on the platform
+    const companyId = req.user?.company_id || req.user?.workspace_id;
+    if (companyId && finalEmail) {
+      try {
+        const guRes = await queryMaster('SELECT id FROM global_portal_users WHERE LOWER(TRIM(email)) = ?', [finalEmail.toLowerCase().trim()]);
+        if (guRes.rows && guRes.rows.length > 0) {
+          const gUserId = guRes.rows[0].id;
+          await queryMaster(
+            `INSERT IGNORE INTO global_portal_memberships (id, global_user_id, company_id, entity_id, portal_type, status, joined_at)
+             VALUES (?, ?, ?, ?, 'customer', 'Active', NOW())`,
+            [crypto.randomUUID(), gUserId, companyId, id]
+          );
+        }
+      } catch (err) {
+        console.error('Auto-link customer membership error:', err);
+      }
+    }
 
     const fetched = await req.tenantDb.query('SELECT * FROM customers WHERE id = ?', [id]);
     return res.status(201).json(parsePartyContacts(fetched.rows[0]));

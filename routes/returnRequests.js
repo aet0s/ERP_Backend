@@ -229,8 +229,15 @@ router.get('/return-requests/:id', requireAuth, async (req, res) => {
   try {
     const result = await req.tenantDb.query(
       `SELECT rr.*, 
-              v.name AS vendor_name, v.email AS vendor_email, v.phone AS vendor_phone, v.address AS vendor_address, v.gstin AS vendor_gstin,
-              c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone, c.billing_address AS customer_address, c.gstin AS customer_gstin,
+              v.name AS vendor_name, v.email AS vendor_email, v.phone AS vendor_phone, 
+              v.address AS vendor_address, v.address_line1 AS vendor_address_line1, v.address_line2 AS vendor_address_line2,
+              v.city AS vendor_city, v.state AS vendor_state, v.pincode AS vendor_pincode, v.country AS vendor_country,
+              v.gstin AS vendor_gstin,
+              c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone, 
+              COALESCE(c.billing_address, c.address) AS customer_address,
+              c.billing_address AS customer_billing_address, c.shipping_address AS customer_shipping_address,
+              c.city AS customer_city, c.state AS customer_state, c.pincode AS customer_pincode, c.country AS customer_country,
+              c.gstin AS customer_gstin,
               u.name AS reviewed_by_name,
               CASE 
                 WHEN rr.request_type IN ('purchase_return', 'purchase_cancellation') OR rr.vendor_id IS NOT NULL THEN 'vendor'
@@ -264,6 +271,27 @@ router.get('/return-requests/:id', requireAuth, async (req, res) => {
     if (result.rowCount === 0) return res.status(404).json({ error: 'Return request not found' });
     
     const row = result.rows[0];
+
+    // Format full addresses
+    const custBase = row.customer_billing_address || row.customer_address || '';
+    const custStatePin = row.customer_state ? (row.customer_pincode ? `${row.customer_state} - ${row.customer_pincode}` : row.customer_state) : (row.customer_pincode || '');
+    const custParts = [
+      custBase,
+      row.customer_city,
+      custStatePin,
+      row.customer_country && row.customer_country !== 'India' ? row.customer_country : ''
+    ].filter(Boolean);
+    row.customer_full_address = custParts.join(', ');
+
+    const vendorBase = row.vendor_address || [row.vendor_address_line1, row.vendor_address_line2].filter(Boolean).join(', ');
+    const vendorStatePin = row.vendor_state ? (row.vendor_pincode ? `${row.vendor_state} - ${row.vendor_pincode}` : row.vendor_state) : (row.vendor_pincode || '');
+    const vendorParts = [
+      vendorBase,
+      row.vendor_city,
+      vendorStatePin,
+      row.vendor_country && row.vendor_country !== 'India' ? row.vendor_country : ''
+    ].filter(Boolean);
+    row.vendor_full_address = vendorParts.join(', ');
 
     // If items is null or empty but reference_id exists (e.g. cancellation), load items from referenced document
     let parsedItems = [];
@@ -418,13 +446,26 @@ router.post('/return-requests', requireAuth, requirePermission('returns', 'creat
        vendor_id, customer_id, reason.trim(), items ? JSON.stringify(items) : null]
     );
 
-    // A purchase return is awaiting the vendor's decision, not an internal
-    // approval. Keep the procurement list in step with the request queue.
+    // When a workspace owner/internal staff initiates a purchase return:
+    // Do NOT auto-approve or deduct inventory prematurely.
+    // Set procurement status to 'Return Requested' and notify the vendor.
+    // ONLY when the vendor reviews and ACCEPTS the return request will the flow complete,
+    // deducting inventory stock and issuing the Debit Note!
     if (['purchase_return', 'purchase_cancellation'].includes(request_type) && reference_type === 'procurement') {
       await req.tenantDb.query(
         "UPDATE procurements SET status = 'Return Requested', updated_at = NOW() WHERE id = ? AND deleted_at IS NULL",
         [reference_id]
       );
+
+      if (vendor_id) {
+        await createNotification(req.tenantDb, {
+          user_type: 'vendor_portal',
+          vendor_id,
+          title: 'New Purchase Return Request Received',
+          message: `Buyer has requested a return for Order. Please review and Accept or Reject the return in your portal.`,
+          link: '/portal/returns'
+        }).catch(() => {});
+      }
     }
 
     const fetched = await req.tenantDb.query('SELECT * FROM return_requests WHERE id = ?', [id]);
@@ -464,6 +505,10 @@ router.post('/return-requests/:id/approve', requireAuth, requirePermission('retu
       return res.status(404).json({ error: 'Pending return request not found' });
     }
     const rr = rrRes.rows[0];
+    if (rr && (['purchase_return', 'purchase_cancellation'].includes(rr.request_type) || Boolean(rr.vendor_id))) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Purchase return requests must be reviewed and accepted/rejected by the vendor in the vendor portal' });
+    }
 
     const approvalResult = await executeApproveReturnRequest(client, req.params.id, userId, review_notes);
     const outcomeDocType = approvalResult.outcome_document_type;
@@ -512,12 +557,12 @@ router.post('/return-requests/:id/reject', requireAuth, requirePermission('retur
   }
 
   const currentRes = await req.tenantDb.query(
-    'SELECT request_type, requested_by_type FROM return_requests WHERE id = ? AND status = \'Pending\'',
+    'SELECT request_type, requested_by_type, vendor_id FROM return_requests WHERE id = ? AND status = \'Pending\'',
     [req.params.id]
   );
   const current = currentRes.rows[0];
-  if (current && ['purchase_return', 'purchase_cancellation'].includes(current.request_type) && current.requested_by_type === 'internal') {
-    return res.status(403).json({ error: 'Vendor response is required for this purchase return request' });
+  if (current && (['purchase_return', 'purchase_cancellation'].includes(current.request_type) || Boolean(current.vendor_id))) {
+    return res.status(403).json({ error: 'Purchase return requests must be reviewed and accepted/rejected by the vendor in the vendor portal' });
   }
 
   const updateRes = await req.tenantDb.query(

@@ -180,6 +180,91 @@ router.get('/locations/:id', requireAuth, requirePermission('locations', 'view')
 
     loc.total_valuation = loc.items.reduce((sum, item) => sum + (item.line_total || 0), 0);
 
+    // Fetch Activity Timeline (inventory ledger movements + stock transfers)
+    const [ledgerActivityRes, transferActivityRes] = await Promise.all([
+      req.tenantDb.query(
+        `SELECT il.id, il.item_type, il.item_id, il.transaction_type, il.quantity, il.unit_cost, il.reason, il.date, il.created_at,
+                il.reference_table, il.reference_id,
+                COALESCE(i.name, fg.name, rm.name, 'Inventory Item') AS item_name,
+                COALESCE(i.unit, fg.unit, rm.unit, 'units') AS unit
+         FROM inventory_ledger il
+         LEFT JOIN items i ON i.id = il.item_id
+         LEFT JOIN finished_goods fg ON fg.id = il.item_id
+         LEFT JOIN raw_materials rm ON rm.id = il.item_id
+         WHERE il.location_id = ?
+         ORDER BY il.date DESC, il.created_at DESC
+         LIMIT 60`,
+        [req.params.id]
+      ).catch(() => ({ rows: [] })),
+      req.tenantDb.query(
+        `SELECT st.id, st.transfer_number, st.from_location_id, st.to_location_id, st.item_type, st.item_id,
+                st.quantity, st.notes, st.created_at,
+                lf.name AS from_location_name,
+                lt.name AS to_location_name,
+                COALESCE(i.name, fg.name, rm.name, 'Transferred Item') AS item_name,
+                COALESCE(i.unit, fg.unit, rm.unit, 'units') AS unit
+         FROM stock_transfers st
+         LEFT JOIN locations lf ON lf.id = st.from_location_id
+         LEFT JOIN locations lt ON lt.id = st.to_location_id
+         LEFT JOIN items i ON i.id = st.item_id
+         LEFT JOIN finished_goods fg ON fg.id = st.item_id
+         LEFT JOIN raw_materials rm ON rm.id = st.item_id
+         WHERE (st.from_location_id = ? OR st.to_location_id = ?) AND st.deleted_at IS NULL
+         ORDER BY st.created_at DESC
+         LIMIT 40`,
+        [req.params.id, req.params.id]
+      ).catch(() => ({ rows: [] }))
+    ]);
+
+    const ledgerEvents = (ledgerActivityRes.rows || []).map((r) => ({
+      id: r.id,
+      kind: r.transaction_type === 'in' ? 'Stock In' : 'Stock Out',
+      transaction_type: r.transaction_type,
+      item_name: r.item_name,
+      quantity: Number(r.quantity || 0),
+      unit: r.unit,
+      unit_cost: Number(r.unit_cost || 0),
+      reason: r.reason || (r.reference_table ? `${r.reference_table.replace('_', ' ')} (${r.transaction_type === 'in' ? 'Received' : 'Dispatched'})` : ''),
+      reference_table: r.reference_table,
+      reference_id: r.reference_id,
+      date: r.date || r.created_at,
+      created_at: r.created_at
+    }));
+
+    const transferEvents = (transferActivityRes.rows || []).map((t) => {
+      const isOut = t.from_location_id === req.params.id;
+      return {
+        id: t.id,
+        kind: isOut ? 'Transfer Out' : 'Transfer In',
+        transaction_type: isOut ? 'out' : 'in',
+        item_name: t.item_name,
+        quantity: Number(t.quantity || 0),
+        unit: t.unit,
+        reason: isOut
+          ? `Transferred to ${t.to_location_name || 'Warehouse'} (${t.transfer_number})`
+          : `Received from ${t.from_location_name || 'Warehouse'} (${t.transfer_number})`,
+        reference_table: 'stock_transfers',
+        reference_id: t.transfer_number,
+        date: t.created_at,
+        created_at: t.created_at
+      };
+    });
+
+    loc.timeline = [...ledgerEvents, ...transferEvents].sort(
+      (a, b) => new Date(b.date || b.created_at).getTime() - new Date(a.date || a.created_at).getTime()
+    ).slice(0, 50);
+
+    if (loc.timeline.length === 0 && loc.created_at) {
+      loc.timeline.push({
+        id: `loc-create-${loc.id}`,
+        kind: 'Location Registered',
+        transaction_type: 'info',
+        reason: `Warehouse facility initialized as ${loc.is_default ? 'Primary Default' : 'Secondary'} location.`,
+        date: loc.created_at,
+        created_at: loc.created_at
+      });
+    }
+
     return res.json(loc);
   } catch (err) {
     console.error('get location error', err);

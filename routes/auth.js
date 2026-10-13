@@ -13,6 +13,10 @@ const { requireAuth } = require('../middleware/auth');
 const { logTenantAudit, logMasterAudit } = require('../lib/auditCrypto');
 const { parseRoles, resolveUserRoles } = require('../lib/roles');
 const { ensureDefaultRolePermissions } = require('../lib/defaultPermissions');
+const { sendOtpEmail, sendPasswordResetOtpEmail } = require('../lib/mailer');
+
+const registrationOtps = new Map();
+const passwordResetOtps = new Map();
 
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error('FATAL: JWT_SECRET environment variable is not configured');
@@ -109,7 +113,287 @@ async function persistRefreshToken(tenantClient, user, refreshToken) {
 //   return next();
 // }
 
-// Register workspace/company + owner user
+// POST /auth/register/send-otp — Step 1: Send 6-digit OTP to corporate email
+router.post('/register/send-otp', async (req, res) => {
+  try {
+    const { owner_name, owner_email } = req.body;
+    if (!owner_name || !owner_name.trim()) {
+      return res.status(400).json({ error: 'Owner full name is required' });
+    }
+    if (!owner_email || !/\S+@\S+\.\S+/.test(owner_email)) {
+      return res.status(400).json({ error: 'Valid corporate email address is required' });
+    }
+
+    const normalizedEmail = owner_email.toLowerCase().trim();
+
+    // Check if email already registered in master database
+    const existingCheck = await queryMaster('SELECT id FROM company_users WHERE email = ? LIMIT 1', [normalizedEmail]);
+    if (existingCheck.rows && existingCheck.rows.length > 0) {
+      return res.status(400).json({ error: 'This corporate email is already registered. Please sign in instead.' });
+    }
+
+    // Generate random 6-digit code
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+
+    registrationOtps.set(normalizedEmail, {
+      otp,
+      owner_name: owner_name.trim(),
+      owner_email: normalizedEmail,
+      expiresAt,
+      verified: false,
+      attempts: 0
+    });
+
+    await sendOtpEmail({
+      to: normalizedEmail,
+      name: owner_name.trim(),
+      otp
+    });
+
+    return res.status(200).json({
+      ok: true,
+      message: 'Verification code sent to ' + normalizedEmail
+    });
+  } catch (err) {
+    console.error('Error in send-otp:', err);
+    return res.status(500).json({ error: err.message || 'Failed to dispatch verification code' });
+  }
+});
+
+// POST /auth/register/verify-otp — Step 2: Validate 6-digit OTP
+router.post('/register/verify-otp', async (req, res) => {
+  try {
+    const { owner_email, otp } = req.body;
+    if (!owner_email || !otp) {
+      return res.status(400).json({ error: 'Email and 6-digit verification code are required' });
+    }
+
+    const normalizedEmail = owner_email.toLowerCase().trim();
+    const record = registrationOtps.get(normalizedEmail);
+
+    if (!record || Date.now() > record.expiresAt) {
+      return res.status(400).json({ error: 'Verification code has expired or was not requested. Please request a new code.' });
+    }
+
+    if (record.attempts >= 5) {
+      return res.status(400).json({ error: 'Too many invalid attempts. Please request a new verification code.' });
+    }
+
+    if (String(record.otp).trim() !== String(otp).trim()) {
+      record.attempts += 1;
+      return res.status(400).json({ error: 'Invalid verification code. Please check your email and try again.' });
+    }
+
+    record.verified = true;
+    return res.status(200).json({
+      ok: true,
+      message: 'Corporate email verified successfully.'
+    });
+  } catch (err) {
+    console.error('Error in verify-otp:', err);
+    return res.status(500).json({ error: err.message || 'Failed to verify code' });
+  }
+});
+
+// =============================================================================
+// FORGOT CREDENTIALS / PASSWORD RECOVERY FLOW
+// =============================================================================
+
+// POST /auth/forgot-password/send-otp — Dispatch 6-digit OTP to user's registered email
+router.post('/forgot-password/send-otp', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email || !/\S+@\S+\.\S+/.test(email)) {
+      return res.status(400).json({ error: 'Valid email address is required' });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+
+    // 1. Check master company_users
+    let userFound = false;
+    const cuRes = await queryMaster(
+      `SELECT cu.company_id, cu.user_id, c.database_name, c.status AS company_status
+       FROM company_users cu
+       JOIN companies c ON c.id = cu.company_id
+       WHERE cu.email = ? AND c.status != 'deleted'
+       LIMIT 1`,
+      [normalizedEmail]
+    );
+
+    if (cuRes.rowCount > 0) {
+      userFound = true;
+    } else {
+      // 2. Check global_portal_users
+      const gpuRes = await queryMaster(
+        `SELECT id, email FROM global_portal_users WHERE email = ? LIMIT 1`,
+        [normalizedEmail]
+      ).catch(() => ({ rowCount: 0 }));
+
+      if (gpuRes.rowCount > 0) {
+        userFound = true;
+      } else {
+        // 3. Fallback: Check tenant databases directly
+        const allComps = await queryMaster("SELECT id, database_name FROM companies WHERE status NOT IN ('deleted', 'suspended', 'cancelled', 'paused')");
+        for (const comp of allComps.rows) {
+          const tDb = getTenantPool(comp.database_name);
+          const uCheck = await tDb.query('SELECT id FROM users WHERE email = ? AND deleted_at IS NULL', [normalizedEmail]).catch(() => ({ rows: [] }));
+          if (uCheck.rows && uCheck.rows.length > 0) {
+            userFound = true;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!userFound) {
+      return res.status(404).json({ error: 'No active account found with this email address.' });
+    }
+
+    // Generate random 6-digit OTP
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+
+    passwordResetOtps.set(normalizedEmail, {
+      otp,
+      email: normalizedEmail,
+      expiresAt,
+      verified: false,
+      attempts: 0
+    });
+
+    await sendPasswordResetOtpEmail({
+      to: normalizedEmail,
+      otp
+    });
+
+    return res.status(200).json({
+      ok: true,
+      message: `A 6-digit security code has been sent to ${normalizedEmail}.`
+    });
+  } catch (err) {
+    console.error('Error in /auth/forgot-password/send-otp:', err);
+    return res.status(500).json({ error: err.message || 'Failed to dispatch password recovery code' });
+  }
+});
+
+// POST /auth/forgot-password/verify-otp — Validate 6-digit OTP
+router.post('/forgot-password/verify-otp', async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    if (!email || !otp) {
+      return res.status(400).json({ error: 'Email and 6-digit verification code are required' });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+    const record = passwordResetOtps.get(normalizedEmail);
+
+    if (!record || Date.now() > record.expiresAt) {
+      return res.status(400).json({ error: 'Verification code has expired or was not requested. Please request a new code.' });
+    }
+
+    if (record.attempts >= 5) {
+      return res.status(400).json({ error: 'Too many invalid attempts. Please request a new verification code.' });
+    }
+
+    if (String(record.otp).trim() !== String(otp).trim()) {
+      record.attempts += 1;
+      return res.status(400).json({ error: 'Invalid verification code. Please check your email and try again.' });
+    }
+
+    record.verified = true;
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    record.resetToken = resetToken;
+
+    return res.status(200).json({
+      ok: true,
+      reset_token: resetToken,
+      message: 'Security code verified successfully.'
+    });
+  } catch (err) {
+    console.error('Error in /auth/forgot-password/verify-otp:', err);
+    return res.status(500).json({ error: err.message || 'Failed to verify code' });
+  }
+});
+
+// POST /auth/forgot-password/reset — Set new password
+router.post('/forgot-password/reset', async (req, res) => {
+  try {
+    const { email, reset_token, new_password, confirm_password } = req.body;
+
+    if (!email || !new_password) {
+      return res.status(400).json({ error: 'Email and new password are required' });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+    const record = passwordResetOtps.get(normalizedEmail);
+
+    if (!record || Date.now() > record.expiresAt || !record.verified) {
+      return res.status(400).json({ error: 'Please verify the security code sent to your email before resetting your password.' });
+    }
+
+    if (reset_token && record.resetToken && record.resetToken !== reset_token) {
+      return res.status(400).json({ error: 'Invalid reset authorization token. Please request a new code.' });
+    }
+
+    if (confirm_password && new_password !== confirm_password) {
+      return res.status(400).json({ error: 'Passwords do not match.' });
+    }
+
+    // Password validation rules
+    if (new_password.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters long.' });
+    }
+    if (!/[A-Z]/.test(new_password)) {
+      return res.status(400).json({ error: 'Password must contain at least one uppercase letter (A-Z).' });
+    }
+    if (!/[a-z]/.test(new_password)) {
+      return res.status(400).json({ error: 'Password must contain at least one lowercase letter (a-z).' });
+    }
+    if (!/[0-9]/.test(new_password)) {
+      return res.status(400).json({ error: 'Password must contain at least one number (0-9).' });
+    }
+    if (!/[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?~`]/.test(new_password)) {
+      return res.status(400).json({ error: 'Password must contain at least one special character.' });
+    }
+    if (/\s/.test(new_password)) {
+      return res.status(400).json({ error: 'Password cannot contain spaces.' });
+    }
+
+    const newHash = await bcrypt.hash(new_password, BCRYPT_ROUNDS);
+
+    // 1. Update in all tenant databases where user exists
+    const allComps = await queryMaster("SELECT id, database_name FROM companies WHERE status != 'deleted'");
+    for (const comp of allComps.rows) {
+      try {
+        const tDb = getTenantPool(comp.database_name);
+        await tDb.query('UPDATE users SET password_hash = ? WHERE email = ? AND deleted_at IS NULL', [newHash, normalizedEmail]);
+      } catch (err) {
+        // continue
+      }
+    }
+
+    // 2. Update in global_portal_users if exists
+    try {
+      await queryMaster('UPDATE global_portal_users SET password_hash = ? WHERE email = ?', [newHash, normalizedEmail]);
+    } catch (err) {
+      // ignore
+    }
+
+    // Clean up reset record
+    passwordResetOtps.delete(normalizedEmail);
+
+    return res.status(200).json({
+      ok: true,
+      message: 'Your password has been successfully reset. You can now sign in with your new credentials.'
+    });
+  } catch (err) {
+    console.error('Error in /auth/forgot-password/reset:', err);
+    return res.status(500).json({ error: err.message || 'Failed to reset password' });
+  }
+});
+
+// POST /auth/register — Step 3: Complete registration and provision workspace
 router.post('/register', [
   body('owner_email').custom((val, { req }) => {
     const email = req.body.owner_email || req.body.email;
@@ -135,11 +419,6 @@ router.post('/register', [
       throw new Error('Passwords do not match');
     }
     return true;
-  }),
-  body('company_name').custom((val, { req }) => {
-    const name = req.body.company_name || req.body.workspace_name || req.body.name;
-    if (!name || !name.trim()) throw new Error('Company/workspace name is required');
-    return true;
   })
 ], async (req, res) => {
   const errors = validationResult(req);
@@ -148,11 +427,19 @@ router.post('/register', [
     return res.status(400).json({ error: firstMsg, errors: errors.array() });
   }
 
-  const owner_name = req.body.owner_name || req.body.name || 'Company Owner';
+  const owner_name = (req.body.owner_name || req.body.name || 'Company Owner').trim();
   const owner_email = (req.body.owner_email || req.body.email).toLowerCase().trim();
   const owner_password = req.body.owner_password || req.body.password;
-  const company_name = (req.body.company_name || req.body.workspace_name || req.body.name || '').trim();
-  const business_type = req.body.business_type || null;
+  const otp = req.body.otp;
+
+  // Verify OTP verification status
+  const otpRecord = registrationOtps.get(owner_email);
+  if (!otpRecord || !otpRecord.verified || (otp && String(otpRecord.otp).trim() !== String(otp).trim())) {
+    return res.status(400).json({ error: 'Please verify your corporate email with the OTP code before configuring your password.' });
+  }
+
+  const company_name = (req.body.company_name || req.body.workspace_name || `${owner_name}'s Workspace`).trim();
+  const business_type = req.body.business_type || 'Manufacturing & Trading';
   const currency = req.body.currency || 'INR';
 
   let provisionResult = null;
@@ -181,6 +468,9 @@ router.post('/register', [
       await persistRefreshToken(tenantClient, user, refresh_token);
       setAuthCookies(res, token, refresh_token);
 
+      // Clean up used OTP
+      registrationOtps.delete(owner_email);
+
       return res.status(201).json({
         token,
         refresh_token,
@@ -208,6 +498,7 @@ router.post('/register', [
     return res.status(500).json({ error: err.message || 'Failed to create workspace database' });
   }
 });
+
 
 // POST /auth/login — Single Unified Login Endpoint for All 6 Roles
 // Temporarily disabled: rateLimitLogin middleware.
@@ -298,7 +589,7 @@ router.post('/login', async (req, res) => {
     const user = userRes.rows[0];
 
     if (user.status === 'inactive' || user.status === 'suspended') {
-      return res.status(403).json({ error: 'Account is deactivated' });
+      return res.status(403).json({ error: 'Ask owner to activate your account.' });
     }
 
     // Check Password
@@ -416,7 +707,7 @@ router.get('/me', requireAuth, async (req, res) => {
     return res.json({
       user,
       permissions: permRes.rows,
-      workspace: req.company
+      workspace: { ...req.company, name: req.company.company_name || req.company.name }
     });
   } catch (err) {
     console.error('GET /auth/me error:', err);
