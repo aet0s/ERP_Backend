@@ -154,7 +154,8 @@ router.get('/vendors', requireAuth, requirePermission('parties', 'view'), async 
         END AS portal_status,
         (SELECT COUNT(*) FROM vendor_portal_users vpu WHERE vpu.vendor_id = v.id AND (vpu.last_login_at IS NOT NULL OR vpu.password_hash IS NOT NULL)) AS portal_logged_in_count,
         (SELECT COUNT(*) FROM vendor_portal_users vpu WHERE vpu.vendor_id = v.id) AS portal_users_count,
-        (SELECT MAX(vpu.last_login_at) FROM vendor_portal_users vpu WHERE vpu.vendor_id = v.id) AS portal_last_login_at
+        (SELECT MAX(vpu.last_login_at) FROM vendor_portal_users vpu WHERE vpu.vendor_id = v.id) AS portal_last_login_at,
+        (SELECT vpu.invite_token FROM vendor_portal_users vpu WHERE vpu.vendor_id = v.id AND vpu.invite_token IS NOT NULL LIMIT 1) AS invite_token
       FROM vendors v
       WHERE ${where}
       ${orderClause}
@@ -550,7 +551,8 @@ router.get('/vendors/:id', requireAuth, requirePermission('parties', 'view'), as
         END AS portal_status,
         (SELECT COUNT(*) FROM vendor_portal_users vpu WHERE vpu.vendor_id = v.id AND (vpu.last_login_at IS NOT NULL OR vpu.password_hash IS NOT NULL)) AS portal_logged_in_count,
         (SELECT COUNT(*) FROM vendor_portal_users vpu WHERE vpu.vendor_id = v.id) AS portal_users_count,
-        (SELECT MAX(vpu.last_login_at) FROM vendor_portal_users vpu WHERE vpu.vendor_id = v.id) AS portal_last_login_at
+        (SELECT MAX(vpu.last_login_at) FROM vendor_portal_users vpu WHERE vpu.vendor_id = v.id) AS portal_last_login_at,
+        (SELECT vpu.invite_token FROM vendor_portal_users vpu WHERE vpu.vendor_id = v.id AND vpu.invite_token IS NOT NULL LIMIT 1) AS invite_token
        FROM vendors v
        WHERE v.id = ? AND v.deleted_at IS NULL`,
       [req.params.id]
@@ -1226,7 +1228,8 @@ router.get('/customers', requireAuth, requirePermission('parties', 'view'), asyn
         END AS portal_status,
         (SELECT COUNT(*) FROM customer_portal_users cpu WHERE cpu.customer_id = c.id AND (cpu.last_login_at IS NOT NULL OR cpu.password_hash IS NOT NULL)) AS portal_logged_in_count,
         (SELECT COUNT(*) FROM customer_portal_users cpu WHERE cpu.customer_id = c.id) AS portal_users_count,
-        (SELECT MAX(cpu.last_login_at) FROM customer_portal_users cpu WHERE cpu.customer_id = c.id) AS portal_last_login_at
+        (SELECT MAX(cpu.last_login_at) FROM customer_portal_users cpu WHERE cpu.customer_id = c.id) AS portal_last_login_at,
+        (SELECT cpu.invite_token FROM customer_portal_users cpu WHERE cpu.customer_id = c.id AND cpu.invite_token IS NOT NULL LIMIT 1) AS invite_token
       FROM customers c
       WHERE ${where}
       ${orderClause}
@@ -1279,7 +1282,8 @@ router.get('/customers/:id', requireAuth, requirePermission('parties', 'view'), 
         END AS portal_status,
         (SELECT COUNT(*) FROM customer_portal_users cpu WHERE cpu.customer_id = c.id AND (cpu.last_login_at IS NOT NULL OR cpu.password_hash IS NOT NULL)) AS portal_logged_in_count,
         (SELECT COUNT(*) FROM customer_portal_users cpu WHERE cpu.customer_id = c.id) AS portal_users_count,
-        (SELECT MAX(cpu.last_login_at) FROM customer_portal_users cpu WHERE cpu.customer_id = c.id) AS portal_last_login_at
+        (SELECT MAX(cpu.last_login_at) FROM customer_portal_users cpu WHERE cpu.customer_id = c.id) AS portal_last_login_at,
+        (SELECT cpu.invite_token FROM customer_portal_users cpu WHERE cpu.customer_id = c.id AND cpu.invite_token IS NOT NULL LIMIT 1) AS invite_token
        FROM customers c
        WHERE c.id = ? AND c.deleted_at IS NULL`,
       [req.params.id]

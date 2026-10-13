@@ -273,16 +273,23 @@ router.post('/invoices/:id/confirm', requireCustomerPortalAuth, requirePortalPer
       [req.params.id]
     );
 
-    // Reserve / Deduct Finished Goods Inventory ('out')
-    const itemsRes = await req.tenantDb.query('SELECT * FROM sales_items WHERE sale_id = ?', [req.params.id]);
-    for (const line of itemsRes.rows) {
-      const ledgerId = crypto.randomUUID();
-      await req.tenantDb.query(
-        `INSERT INTO inventory_ledger (
-          id, item_type, item_id, transaction_type, quantity, unit_cost, location_id, reason, reference_table, reference_id, created_by
-        ) VALUES (?, 'finished_good', ?, 'out', ?, ?, ?, ?, 'sales', ?, ?)`,
-        [ledgerId, line.finished_good_id, line.quantity, line.rate_per_unit, sale.location_id, `Sales Order Confirmed ${sale.invoice_number}`, sale.id, req.customerUser.portal_user_id]
-      );
+    // Reserve / Deduct Finished Goods Inventory ('out') if not already deducted
+    const ledgerCheck = await req.tenantDb.query(
+      "SELECT id FROM inventory_ledger WHERE reference_table = 'sales' AND reference_id = ? AND transaction_type = 'out'",
+      [sale.id]
+    );
+
+    if (ledgerCheck.rowCount === 0) {
+      const itemsRes = await req.tenantDb.query('SELECT * FROM sales_items WHERE sale_id = ?', [req.params.id]);
+      for (const line of itemsRes.rows) {
+        const ledgerId = crypto.randomUUID();
+        await req.tenantDb.query(
+          `INSERT INTO inventory_ledger (
+            id, item_type, item_id, transaction_type, quantity, unit_cost, location_id, reason, reference_table, reference_id, created_by
+          ) VALUES (?, 'finished_good', ?, 'out', ?, ?, ?, ?, 'sales', ?, ?)`,
+          [ledgerId, line.finished_good_id, line.quantity, line.rate_per_unit, sale.location_id, `Sales Order Confirmed ${sale.invoice_number}`, sale.id, req.customerUser.portal_user_id]
+        );
+      }
     }
 
     await createNotification(req.tenantDb, {

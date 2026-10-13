@@ -10,6 +10,7 @@ const { issueAccessToken, buildRefreshToken, persistRefreshToken, setAuthCookies
 const { getFrontendBaseUrl } = require('../lib/urlUtils');
 const { normaliseAssignment, resolveUserRoles, ASSIGNABLE_ROLES } = require('../lib/roles');
 const { ensureDefaultRolePermissions } = require('../lib/defaultPermissions');
+const { sendInvitationEmail } = require('../lib/mailer');
 
 const BCRYPT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || '12', 10);
 const VALID_ROLES = ASSIGNABLE_ROLES;
@@ -599,7 +600,39 @@ router.post('/invites', requireAuth, requirePermission('users', 'create'), async
     }
 
     const base = getFrontendBaseUrl(req);
-    return res.status(201).json({ ...inviteRecord, signup_link: `${base}/accept-invite?token=${token}` });
+    const signupLink = `${base}/accept-invite?token=${token}`;
+
+    let emailSent = false;
+    let emailError = null;
+    try {
+      const compRes = await queryMaster('SELECT company_name FROM companies WHERE id = ?', [companyId]);
+      const workspaceName = compRes.rows[0]?.company_name || 'ERP Workspace';
+      await sendInvitationEmail({
+        to: normalizedEmail,
+        name: normalizedEmail.split('@')[0],
+        inviterName: req.user?.name || req.user?.email || 'Workspace Admin',
+        workspaceName,
+        role,
+        inviteType: 'workspace_member',
+        inviteLink: signupLink,
+        expiresAt
+      });
+      emailSent = true;
+    } catch (mErr) {
+      console.error('[SMTP User Invite Error]', mErr.message);
+      emailError = mErr.message;
+    }
+
+    return res.status(201).json({
+      ...inviteRecord,
+      signup_link: signupLink,
+      invite_link: signupLink,
+      email_sent: emailSent,
+      email_error: emailError,
+      message: emailSent
+        ? 'Workspace invitation and email sent successfully.'
+        : 'Workspace invitation link generated successfully.'
+    });
   } catch (err) {
     console.error('create invite error', err);
     return res.status(500).json({ error: 'Failed to create invite' });

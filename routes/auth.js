@@ -886,6 +886,206 @@ router.post('/logout', async (req, res) => {
   return res.json({ ok: true, message: 'Logged out successfully' });
 });
 
+// GET /auth/verify-invite & /auth/invite-info
+router.get(['/verify-invite', '/invite-info'], async (req, res) => {
+  const token = req.query.token;
+  if (!token) return res.status(400).json({ ok: false, error: 'Token is required' });
+
+  try {
+    // 1. Check company_invites (workspace staff members)
+    const empRes = await queryMaster(
+      `SELECT ci.*, c.company_name, c.company_code
+       FROM company_invites ci
+       JOIN companies c ON c.id = ci.company_id
+       WHERE ci.token = ?`,
+      [token]
+    );
+
+    if (empRes.rowCount > 0) {
+      const emp = empRes.rows[0];
+      if (emp.expires_at && new Date(emp.expires_at) <= new Date()) {
+        return res.status(400).json({ ok: false, error: 'This invitation link has expired. Please ask the company admin to re-invite you.' });
+      }
+      if (emp.accepted_at) {
+        return res.status(400).json({ ok: false, error: 'This invitation has already been accepted. Please sign in.' });
+      }
+
+      return res.json({
+        ok: true,
+        type: 'workspace',
+        portal_type: 'workspace_member',
+        company_id: emp.company_id,
+        company_name: emp.company_name,
+        company_code: emp.company_code,
+        email: emp.email,
+        role: emp.role,
+        name: '',
+        has_password: false
+      });
+    }
+
+    // 2. Check global_portal_memberships (vendor / customer partners)
+    const memRes = await queryMaster(
+      `SELECT gpm.*, c.company_name, c.company_code, c.currency, gu.email, gu.name AS user_name, gu.password_hash
+       FROM global_portal_memberships gpm
+       JOIN companies c ON c.id = gpm.company_id
+       JOIN global_portal_users gu ON gu.id = gpm.global_user_id
+       WHERE gpm.invite_token = ?`,
+      [token]
+    );
+
+    if (memRes.rowCount > 0) {
+      const mem = memRes.rows[0];
+      if (mem.invite_expires_at && new Date(mem.invite_expires_at) <= new Date()) {
+        return res.status(400).json({ ok: false, error: 'This invitation link has expired. Please ask the company to re-invite you.' });
+      }
+
+      return res.json({
+        ok: true,
+        type: mem.portal_type,
+        portal_type: mem.portal_type,
+        company_id: mem.company_id,
+        company_name: mem.company_name,
+        company_code: mem.company_code,
+        email: mem.email,
+        name: mem.user_name,
+        has_password: !!mem.password_hash
+      });
+    }
+
+    return res.status(404).json({ ok: false, error: 'Invalid or expired invitation link' });
+  } catch (err) {
+    console.error('auth verify invite error', err);
+    return res.status(500).json({ ok: false, error: 'Failed to verify invitation' });
+  }
+});
+
+function validateStrongPassword(password) {
+  if (!password || typeof password !== 'string') return 'Password is required';
+  if (password.length < 8) return 'Password must be at least 8 characters long';
+  if (!/[A-Z]/.test(password)) return 'Password must contain at least one uppercase letter (A-Z)';
+  if (!/[a-z]/.test(password)) return 'Password must contain at least one lowercase letter (a-z)';
+  if (!/[0-9]/.test(password)) return 'Password must contain at least one number (0-9)';
+  if (!/[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?~`]/.test(password)) return 'Password must contain at least one special character (like @, #, $, _)';
+  if (/\s/.test(password)) return 'Password cannot contain spaces';
+  return null;
+}
+
+// POST /auth/accept-invite
+router.post('/accept-invite', async (req, res) => {
+  const { token, name, password } = req.body;
+  if (!token || !password) {
+    return res.status(400).json({ error: 'Token and password are required' });
+  }
+  const passError = validateStrongPassword(password);
+  if (passError) {
+    return res.status(400).json({ error: passError });
+  }
+
+  // 1. Check if token is for workspace member
+  const inviteRes = await queryMaster(
+    `SELECT ci.id, ci.company_id, ci.email, ci.role, ci.location_id, ci.accepted_at, ci.expires_at, c.database_name, c.company_name, c.company_code, c.currency, c.status AS company_status
+     FROM company_invites ci
+     JOIN companies c ON c.id = ci.company_id
+     WHERE ci.token = ?`,
+    [token]
+  );
+
+  if (inviteRes.rowCount > 0) {
+    const inviteRecord = inviteRes.rows[0];
+    if (inviteRecord.accepted_at || new Date(inviteRecord.expires_at) <= new Date() || inviteRecord.company_status !== 'active') {
+      return res.status(400).json({ error: 'Invalid or expired invitation token' });
+    }
+
+    const normalizedEmail = inviteRecord.email.toLowerCase().trim();
+    const displayName = (name && name.trim()) ? name.trim() : normalizedEmail.split('@')[0];
+
+    const existingMaster = await queryMaster('SELECT id, status FROM company_users WHERE email = ? AND company_id = ?', [normalizedEmail, inviteRecord.company_id]);
+    if (existingMaster.rowCount > 0 && existingMaster.rows[0].status !== 'deleted') {
+      return res.status(400).json({ error: 'An active user with this email is already registered in this workspace' });
+    }
+
+    const targetTenantPool = getTenantPool(inviteRecord.database_name);
+    const tenantClient = await targetTenantPool.connect();
+
+    try {
+      await tenantClient.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS roles TEXT NULL').catch(() => {});
+      await tenantClient.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS location_id VARCHAR(36) NULL').catch(() => {});
+      await tenantClient.query('START TRANSACTION');
+      const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+      const newUserId = crypto.randomUUID();
+
+      const existingTenantUser = await tenantClient.query('SELECT id FROM users WHERE email = ?', [normalizedEmail]);
+      let resolvedUserId = newUserId;
+      if (existingTenantUser.rowCount > 0) {
+        resolvedUserId = existingTenantUser.rows[0].id;
+        await tenantClient.query(
+          `UPDATE users SET name = ?, password_hash = ?, role = ?, roles = ?, location_id = COALESCE(?, location_id), status = 'active', deleted_at = NULL, last_login_at = NOW() WHERE email = ?`,
+          [displayName, hash, inviteRecord.role, inviteRecord.role, inviteRecord.location_id || null, normalizedEmail]
+        );
+      } else {
+        await tenantClient.query(
+          `INSERT INTO users (id, name, email, password_hash, role, roles, location_id, status, created_at, last_login_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'active', NOW(), NOW())`,
+          [newUserId, displayName, normalizedEmail, hash, inviteRecord.role, inviteRecord.role, inviteRecord.location_id || null]
+        );
+      }
+
+      await queryMaster(
+        `INSERT INTO company_users (id, company_id, email, role, status, created_at)
+         VALUES (?, ?, ?, ?, 'active', NOW())
+         ON DUPLICATE KEY UPDATE role = VALUES(role), status = 'active'`,
+        [resolvedUserId, inviteRecord.company_id, normalizedEmail, inviteRecord.role]
+      );
+
+      await queryMaster('UPDATE company_invites SET accepted_at = NOW() WHERE id = ?', [inviteRecord.id]);
+      await tenantClient.query('COMMIT');
+
+      const userPayload = {
+        id: resolvedUserId,
+        name: displayName,
+        email: normalizedEmail,
+        role: inviteRecord.role,
+        roles: [inviteRecord.role],
+        location_id: inviteRecord.location_id || null,
+        company_id: inviteRecord.company_id,
+        database_name: inviteRecord.database_name
+      };
+      const userToken = issueAccessToken(userPayload, inviteRecord.company_id);
+      const newRefreshToken = buildRefreshToken();
+      await persistRefreshToken(targetTenantPool, userPayload, newRefreshToken).catch(() => {});
+      setAuthCookies(res, userToken, newRefreshToken);
+
+      return res.json({
+        ok: true,
+        token: userToken,
+        user: userPayload,
+        workspace: {
+          id: inviteRecord.company_id,
+          name: inviteRecord.company_name,
+          code: inviteRecord.company_code,
+          currency: inviteRecord.currency || 'INR'
+        },
+        message: 'Account created successfully! Welcome to the workspace.'
+      });
+    } catch (err) {
+      await tenantClient.query('ROLLBACK').catch(() => {});
+      console.error('Accept invite error:', err);
+      return res.status(500).json({ error: 'Failed to accept invitation: ' + err.message });
+    } finally {
+      tenantClient.release();
+    }
+  }
+
+  // 2. Check if token is for partner portal
+  const portalAuthRoute = require('./portalAuth');
+  if (portalAuthRoute.handlePortalAcceptInvite) {
+    return portalAuthRoute.handlePortalAcceptInvite(req, res);
+  }
+
+  return res.status(400).json({ error: 'Invalid or expired invitation token' });
+});
+
 router.issueAccessToken = issueAccessToken;
 router.buildRefreshToken = buildRefreshToken;
 router.persistRefreshToken = persistRefreshToken;

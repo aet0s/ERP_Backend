@@ -734,7 +734,8 @@ router.post('/', requireAuth, requirePermission('sales', 'create'), async (req, 
   const {
     customer_id, date, due_date, place_of_supply,
     items = [], invoice_discount = 0, amount_received = 0,
-    terms_and_conditions, notes, send_to_customer = false
+    terms_and_conditions, notes, send_to_customer = false,
+    direct_outward = true
   } = req.body;
 
   if (!items || !Array.isArray(items) || items.length === 0) {
@@ -889,7 +890,18 @@ router.post('/', requireAuth, requirePermission('sales', 'create'), async (req, 
     const paymentStatus = due <= 0.01 ? 'Paid' : (received > 0 ? 'Partially Paid' : 'Unpaid');
 
     const invoiceNumber = await getNextDocumentNumber(req.tenantDb, 'invoice');
-    const initialStatus = send_to_customer ? 'Sales Order Sent' : (customer_id ? 'Ordered' : 'Draft');
+    const isDirectOutward = req.body.direct_outward !== undefined
+      ? Boolean(req.body.direct_outward)
+      : (req.body.status === 'Delivered' || direct_outward === true);
+
+    const initialStatus = isDirectOutward
+      ? 'Delivered'
+      : (send_to_customer ? 'Sales Order Sent' : (customer_id ? 'Ordered' : 'Draft'));
+
+    const now = new Date();
+    const dDate = isDirectOutward ? now : null;
+    const delivDate = isDirectOutward ? now : null;
+    const trackingRef = isDirectOutward ? 'Direct Outward' : null;
 
     await req.tenantDb.query('START TRANSACTION');
     const saleId = crypto.randomUUID();
@@ -899,15 +911,17 @@ router.post('/', requireAuth, requirePermission('sales', 'create'), async (req, 
         id, invoice_number, customer_id, location_id, finished_good_id, quantity, rate_per_unit,
         date, due_date, place_of_supply, subtotal, cgst_amount, sgst_amount, igst_amount,
         total_tax, discount_amount, pre_rounding_total, round_off_amount,
-        total_amount, amount_received, amount_due, payment_status, notes, terms_and_conditions, status, sent_at
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        total_amount, amount_received, amount_due, payment_status, notes, terms_and_conditions, status, sent_at,
+        dispatch_date, delivered_date, dispatch_tracking_ref
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [
         saleId, invoiceNumber, customer_id || null, targetLocationId, calculatedLines[0].finished_good_id, calculatedLines[0].quantity, calculatedLines[0].rate_per_unit,
         date || new Date().toISOString().slice(0, 10), due_date || null, place_of_supply || customerState,
         totals.subtotal, totals.cgst_amount, totals.sgst_amount, totals.igst_amount,
         totals.total_tax, totals.discount_amount, totals.pre_rounding_total, totals.round_off_amount,
         totals.total_amount, received, due, paymentStatus, notes, terms_and_conditions, initialStatus,
-        send_to_customer ? new Date() : null
+        send_to_customer ? new Date() : null,
+        dDate, delivDate, trackingRef
       ]
     );
 
@@ -927,8 +941,30 @@ router.post('/', requireAuth, requirePermission('sales', 'create'), async (req, 
           line.igst_rate, line.igst_amount, line.line_total
         ]
       );
-      // Note: Finished goods inventory is NOT deducted upon order placement;
-      // it is deducted when workspace dispatches the shipment via POST /api/invoices/:id/dispatch.
+
+      // DIRECT OUTWARD INVENTORY DEDUCTION:
+      // If direct outward is checked, deduct finished goods inventory ('out') immediately
+      if (isDirectOutward) {
+        const baseDeductQty = Number(line.quantity) * (Number(line.units_per_package) || 1);
+        const ledgerId = crypto.randomUUID();
+        await req.tenantDb.query(
+          `INSERT INTO inventory_ledger (
+            id, item_type, item_id, location_id, packaging_level_id, package_count, transaction_type, quantity, unit_cost, reason, reference_table, reference_id, created_by
+          ) VALUES (?, 'finished_good', ?, ?, ?, ?, 'out', ?, ?, ?, 'sales', ?, ?)`,
+          [
+            ledgerId,
+            line.finished_good_id,
+            targetLocationId,
+            line.packaging_level_id || null,
+            Number(line.quantity),
+            baseDeductQty,
+            line.rate_per_unit,
+            `Direct Outward Sale ${invoiceNumber}`,
+            saleId,
+            req.user.id
+          ]
+        );
+      }
     }
 
     if (received > 0) {
@@ -940,7 +976,7 @@ router.post('/', requireAuth, requirePermission('sales', 'create'), async (req, 
       );
     }
 
-    if (send_to_customer && customer_id) {
+    if (!isDirectOutward && send_to_customer && customer_id) {
       await createNotification(req.tenantDb, {
         user_type: 'customer_portal',
         customer_id,
@@ -1007,17 +1043,24 @@ router.post('/:id/confirm', requireAuth, async (req, res) => {
       [req.params.id]
     );
 
-    // Deduct Finished Goods Inventory ('out')
-    const itemsRes = await req.tenantDb.query('SELECT * FROM sales_items WHERE sale_id = ?', [req.params.id]);
-    for (const line of itemsRes.rows) {
-      const baseDeductQty = Number(line.quantity) * (Number(line.units_per_package) || 1);
-      const ledgerId = crypto.randomUUID();
-      await req.tenantDb.query(
-        `INSERT INTO inventory_ledger (
-          id, item_type, item_id, location_id, packaging_level_id, package_count, transaction_type, quantity, unit_cost, reason, reference_table, reference_id, created_by
-        ) VALUES (?, 'finished_good', ?, ?, ?, ?, 'out', ?, ?, ?, 'sales', ?, ?)`,
-        [ledgerId, line.finished_good_id, sale.location_id, line.packaging_level_id || null, Number(line.quantity), baseDeductQty, line.rate_per_unit, `Sales Order Confirmed ${sale.invoice_number}`, sale.id, req.user.id]
-      );
+    // Deduct Finished Goods Inventory ('out') if not already deducted
+    const ledgerCheck = await req.tenantDb.query(
+      "SELECT id FROM inventory_ledger WHERE reference_table = 'sales' AND reference_id = ? AND transaction_type = 'out'",
+      [sale.id]
+    );
+
+    if (ledgerCheck.rowCount === 0) {
+      const itemsRes = await req.tenantDb.query('SELECT * FROM sales_items WHERE sale_id = ?', [req.params.id]);
+      for (const line of itemsRes.rows) {
+        const baseDeductQty = Number(line.quantity) * (Number(line.units_per_package) || 1);
+        const ledgerId = crypto.randomUUID();
+        await req.tenantDb.query(
+          `INSERT INTO inventory_ledger (
+            id, item_type, item_id, location_id, packaging_level_id, package_count, transaction_type, quantity, unit_cost, reason, reference_table, reference_id, created_by
+          ) VALUES (?, 'finished_good', ?, ?, ?, ?, 'out', ?, ?, ?, 'sales', ?, ?)`,
+          [ledgerId, line.finished_good_id, sale.location_id, line.packaging_level_id || null, Number(line.quantity), baseDeductQty, line.rate_per_unit, `Sales Order Confirmed ${sale.invoice_number}`, sale.id, req.user.id]
+        );
+      }
     }
 
     await req.tenantDb.query('COMMIT');
@@ -1176,23 +1219,61 @@ router.post('/:id/deliver', requireAuth, requirePermission('sales', 'approve'), 
     if (saleRes.rowCount === 0) return res.status(404).json({ error: 'Sales order not found' });
     const sale = saleRes.rows[0];
 
+    await req.tenantDb.query('START TRANSACTION');
+
     await req.tenantDb.query(
       "UPDATE sales SET status = 'Delivered', delivered_date = NOW(), updated_at = NOW() WHERE id = ?",
       [req.params.id]
     );
 
+    // Deduct finished goods inventory ('out') if not already deducted upon confirm or dispatch
+    const ledgerCheck = await req.tenantDb.query(
+      "SELECT id FROM inventory_ledger WHERE reference_table = 'sales' AND reference_id = ? AND transaction_type = 'out'",
+      [sale.id]
+    );
+
+    if (ledgerCheck.rowCount === 0) {
+      const itemsRes = await req.tenantDb.query('SELECT * FROM sales_items WHERE sale_id = ?', [sale.id]);
+      const defaultLocRes = await req.tenantDb.query('SELECT id FROM locations WHERE is_default = 1 LIMIT 1');
+      const targetLocId = sale.location_id || defaultLocRes.rows[0]?.id || null;
+
+      for (const line of itemsRes.rows) {
+        const baseDeductQty = Number(line.quantity) * (Number(line.units_per_package) || 1);
+        const ledgerId = crypto.randomUUID();
+        await req.tenantDb.query(
+          `INSERT INTO inventory_ledger (
+            id, item_type, item_id, location_id, packaging_level_id, package_count, transaction_type, quantity, unit_cost, reason, reference_table, reference_id, created_by
+          ) VALUES (?, 'finished_good', ?, ?, ?, ?, 'out', ?, ?, ?, 'sales', ?, ?)`,
+          [
+            ledgerId,
+            line.finished_good_id,
+            targetLocId,
+            line.packaging_level_id || null,
+            Number(line.quantity),
+            baseDeductQty,
+            line.rate_per_unit,
+            `Sales Order Delivered ${sale.invoice_number}`,
+            sale.id,
+            req.user.id
+          ]
+        );
+      }
+    }
+
     if (sale.customer_id) {
       await createNotification(req.tenantDb, {
         user_type: 'customer_portal',
-        customer_id: sale.customer_id,
+        customer_id,
         title: 'Order Delivered',
         message: `Your order ${sale.invoice_number} has been marked as delivered.`,
         link: `/customer-portal/orders/${sale.id}`
       });
     }
 
+    await req.tenantDb.query('COMMIT');
     return res.json({ ok: true, message: 'Order marked as delivered' });
   } catch (err) {
+    await req.tenantDb.query('ROLLBACK').catch(() => {});
     return res.status(500).json({ error: 'Failed to mark order as delivered' });
   }
 });

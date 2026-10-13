@@ -18,6 +18,7 @@ const { calculateInvoiceLine, calculateInvoiceTotals, getNextDocumentNumber } = 
 const { publishReturnRequestMessage } = require('../lib/returnRequestSocket');
 const { getFrontendBaseUrl } = require('../lib/urlUtils');
 const { executeApproveReturnRequest, getSaleFinancials } = require('../lib/returnsEngine');
+const { sendInvitationEmail } = require('../lib/mailer');
 
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error('FATAL: JWT_SECRET environment variable is not configured');
@@ -3063,25 +3064,45 @@ router.post('/vendors/:id/portal-invite', requireAuth, requirePermission('partie
       [vendorId]
     ).catch(() => {});
 
-    // Link: existing user with password logs in to Connections page; passwordless gets set-password link
-    const inviteLink = globalUser.password_hash
-      ? `${base}/login?portal=partner&redirect=/portal/connections`
-      : `${base}/portal/accept-invite?token=${inviteToken}&company=${companyId}&type=vendor`;
+    // Always generate full tokenized invite link for direct acceptance & password setup
+    const inviteLink = `${base}/portal/accept-invite?token=${inviteToken}&company=${companyId}&type=vendor`;
 
     const compRes = await queryMaster('SELECT company_name FROM companies WHERE id = ?', [companyId]);
     const workspaceName = compRes.rows[0]?.company_name || 'A client workspace';
-    const inviteText = globalUser.password_hash
-      ? `${workspaceName} wants to connect with you. Please sign in to your Partner Portal to review and accept the connection request:\n${inviteLink}`
-      : `Hello ${name.trim()},\n\nYou have been invited by ${workspaceName} to access the Partner Portal. Please set your password here:\n${inviteLink}`;
+    const inviteText = `Hello ${name.trim()},\n\nYou have been invited by ${workspaceName} to access the Vendor Portal.\n\nPlease accept the invitation and set up your access here:\n${inviteLink}`;
+
+    let emailSent = false;
+    let emailError = null;
+    try {
+      await sendInvitationEmail({
+        to: normalizedEmail,
+        name: vendorContactPerson || name.trim(),
+        inviterName: req.user?.name || req.user?.email || 'Workspace Admin',
+        workspaceName,
+        role: 'Vendor / Supplier',
+        inviteType: 'vendor',
+        inviteLink,
+        expiresAt: inviteExpires
+      });
+      emailSent = true;
+    } catch (mErr) {
+      console.error('[SMTP Vendor Invite Error]', mErr.message);
+      emailError = mErr.message;
+    }
 
     return res.status(200).json({
       ok: true,
       portal_user_id: globalUser.id,
       email: normalizedEmail,
+      invite_token: inviteToken,
       invite_link: inviteLink,
       invite_text: inviteText,
       expires_at: inviteExpires,
-      message: 'Portal invitation sent successfully.'
+      email_sent: emailSent,
+      email_error: emailError,
+      message: emailSent
+        ? 'Portal invitation and email sent successfully.'
+        : 'Portal invitation link generated successfully.'
     });
   } catch (err) {
     console.error('vendor portal invite error', err);
@@ -3154,6 +3175,97 @@ async function handlePortalAcceptInvite(req, res, forcedPortalType = null) {
     }
 
     if (!globalUser) {
+      // Check company_invites for internal workspace member invites
+      const compInviteRes = await queryMaster(
+        `SELECT ci.id, ci.company_id, ci.email, ci.role, ci.location_id, ci.accepted_at, ci.expires_at, c.database_name, c.company_name, c.company_code, c.currency, c.status AS company_status
+         FROM company_invites ci
+         JOIN companies c ON c.id = ci.company_id
+         WHERE ci.token = ?`,
+        [token]
+      );
+      if (compInviteRes.rowCount > 0) {
+        const invRec = compInviteRes.rows[0];
+        if (invRec.accepted_at || (invRec.expires_at && new Date(invRec.expires_at) <= new Date()) || invRec.company_status !== 'active') {
+          return res.status(400).json({ error: 'This invitation has already been accepted or has expired.' });
+        }
+        
+        const normalizedEmail = invRec.email.toLowerCase().trim();
+        const displayName = (req.body.name && req.body.name.trim()) ? req.body.name.trim() : normalizedEmail.split('@')[0];
+
+        const existingMaster = await queryMaster('SELECT id, status FROM company_users WHERE email = ? AND company_id = ?', [normalizedEmail, invRec.company_id]);
+        if (existingMaster.rowCount > 0 && existingMaster.rows[0].status !== 'deleted') {
+          return res.status(400).json({ error: 'An active user with this email is already registered in this workspace' });
+        }
+
+        const targetTenantPool = getTenantPool(invRec.database_name);
+        const tenantClient = await targetTenantPool.connect();
+        try {
+          await tenantClient.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS roles TEXT NULL').catch(() => {});
+          await tenantClient.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS location_id VARCHAR(36) NULL').catch(() => {});
+          await tenantClient.query('START TRANSACTION');
+          const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+          const newUserId = crypto.randomUUID();
+
+          const existingTenantUser = await tenantClient.query('SELECT id FROM users WHERE email = ?', [normalizedEmail]);
+          let resolvedUserId = newUserId;
+          if (existingTenantUser.rowCount > 0) {
+            resolvedUserId = existingTenantUser.rows[0].id;
+            await tenantClient.query(
+              `UPDATE users SET name = ?, password_hash = ?, role = ?, roles = ?, location_id = COALESCE(?, location_id), status = 'active', deleted_at = NULL, last_login_at = NOW() WHERE email = ?`,
+              [displayName, hash, invRec.role, invRec.role, invRec.location_id || null, normalizedEmail]
+            );
+          } else {
+            await tenantClient.query(
+              `INSERT INTO users (id, name, email, password_hash, role, roles, location_id, status, created_at, last_login_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'active', NOW(), NOW())`,
+              [newUserId, displayName, normalizedEmail, hash, invRec.role, invRec.role, invRec.location_id || null]
+            );
+          }
+
+          // Master company_users registration
+          await queryMaster(
+            `INSERT INTO company_users (id, company_id, email, role, status, created_at)
+             VALUES (?, ?, ?, ?, 'active', NOW())
+             ON DUPLICATE KEY UPDATE role = VALUES(role), status = 'active'`,
+            [resolvedUserId, invRec.company_id, normalizedEmail, invRec.role]
+          );
+
+          // Mark invitation as accepted
+          await queryMaster('UPDATE company_invites SET accepted_at = NOW() WHERE id = ?', [invRec.id]);
+          await tenantClient.query('COMMIT');
+
+          const userPayload = {
+            id: resolvedUserId,
+            name: displayName,
+            email: normalizedEmail,
+            role: invRec.role,
+            roles: [invRec.role],
+            location_id: invRec.location_id || null,
+            company_id: invRec.company_id,
+            database_name: invRec.database_name
+          };
+          const userToken = jwt.sign(userPayload, JWT_SECRET, { expiresIn: '7d' });
+
+          return res.json({
+            ok: true,
+            token: userToken,
+            user: userPayload,
+            workspace: {
+              id: invRec.company_id,
+              name: invRec.company_name,
+              code: invRec.company_code,
+              currency: invRec.currency || 'INR'
+            },
+            message: 'Workspace invitation accepted successfully! Welcome aboard.'
+          });
+        } catch (tErr) {
+          await tenantClient.query('ROLLBACK').catch(() => {});
+          throw tErr;
+        } finally {
+          tenantClient.release();
+        }
+      }
+
       return res.status(400).json({ error: 'Invalid or expired invite token' });
     }
 
@@ -3239,8 +3351,18 @@ async function handlePortalAcceptInvite(req, res, forcedPortalType = null) {
   }
 }
 
-// Check invite details (for partner portal invitations)
-router.get(['/portal/auth/invite-info', '/auth/invite-info', '/vendor-portal/auth/invite-info', '/customer-portal/auth/invite-info'], async (req, res) => {
+// Check invite details (for partner portal invitations and workspace member invites)
+router.get([
+  '/portal/auth/invite-info',
+  '/auth/invite-info',
+  '/vendor-portal/auth/invite-info',
+  '/customer-portal/auth/invite-info',
+  '/portal/verify-invite',
+  '/auth/verify-invite',
+  '/api/portal/verify-invite',
+  '/api/auth/verify-invite',
+  '/verify-invite'
+], async (req, res) => {
   const token = req.query.token;
   if (!token) return res.status(400).json({ ok: false, error: 'Token is required' });
 
@@ -3278,6 +3400,7 @@ router.get(['/portal/auth/invite-info', '/auth/invite-info', '/vendor-portal/aut
 
       return res.json({
         ok: true,
+        type: 'workspace',
         portal_type: 'workspace_member',
         company_id: emp.company_id,
         company_name: emp.company_name,
@@ -3296,6 +3419,7 @@ router.get(['/portal/auth/invite-info', '/auth/invite-info', '/vendor-portal/aut
 
     return res.json({
       ok: true,
+      type: mem.portal_type,
       portal_type: mem.portal_type,
       company_id: mem.company_id,
       company_name: mem.company_name,
@@ -3310,9 +3434,16 @@ router.get(['/portal/auth/invite-info', '/auth/invite-info', '/vendor-portal/aut
   }
 });
 
-// VENDOR PORTAL: ACCEPT INVITE
+// ACCEPT INVITE (Universal for Vendor, Customer & Workspace Members)
 router.post('/vendor-portal/auth/accept-invite', (req, res) => handlePortalAcceptInvite(req, res, 'vendor'));
-router.post(['/portal/auth/accept-invite', '/auth/accept-invite'], (req, res) => handlePortalAcceptInvite(req, res));
+router.post([
+  '/portal/auth/accept-invite',
+  '/auth/accept-invite',
+  '/portal/accept-invite',
+  '/api/portal/accept-invite',
+  '/api/auth/accept-invite',
+  '/accept-invite'
+], (req, res) => handlePortalAcceptInvite(req, res));
 
 // VENDOR PORTAL: FORGOT & RESET PASSWORD
 router.post('/vendor-portal/auth/forgot-password', async (req, res) => {
@@ -3716,25 +3847,45 @@ router.post('/customers/:id/portal-invite', requireAuth, requirePermission('part
       [customerId]
     ).catch(() => {});
 
-    // Link: existing user with password logs in to Connections page; passwordless gets set-password link
-    const inviteLink = globalUser.password_hash
-      ? `${base}/login?portal=partner&redirect=/portal/connections`
-      : `${base}/portal/accept-invite?token=${inviteToken}&company=${companyId}&type=customer`;
+    // Always generate full tokenized invite link for direct acceptance & password setup
+    const inviteLink = `${base}/portal/accept-invite?token=${inviteToken}&company=${companyId}&type=customer`;
 
     const compRes = await queryMaster('SELECT company_name FROM companies WHERE id = ?', [companyId]);
     const workspaceName = compRes.rows[0]?.company_name || 'A client workspace';
-    const inviteText = globalUser.password_hash
-      ? `${workspaceName} wants to connect with you. Please sign in to your Partner Portal to review and accept the connection request:\n${inviteLink}`
-      : `Hello ${name.trim()},\n\nYou have been invited by ${workspaceName} to access the Partner Portal. Please set your password here:\n${inviteLink}`;
+    const inviteText = `Hello ${name.trim()},\n\nYou have been invited by ${workspaceName} to access the Customer Portal.\n\nPlease accept the invitation and set up your access here:\n${inviteLink}`;
+
+    let emailSent = false;
+    let emailError = null;
+    try {
+      await sendInvitationEmail({
+        to: normalizedEmail,
+        name: custContactPerson || name.trim(),
+        inviterName: req.user?.name || req.user?.email || 'Workspace Admin',
+        workspaceName,
+        role: 'Customer / Buyer',
+        inviteType: 'customer',
+        inviteLink,
+        expiresAt: inviteExpires
+      });
+      emailSent = true;
+    } catch (mErr) {
+      console.error('[SMTP Customer Invite Error]', mErr.message);
+      emailError = mErr.message;
+    }
 
     return res.status(200).json({
       ok: true,
       portal_user_id: globalUser.id,
       email: normalizedEmail,
+      invite_token: inviteToken,
       invite_link: inviteLink,
       invite_text: inviteText,
       expires_at: inviteExpires,
-      message: 'Portal invitation sent successfully.'
+      email_sent: emailSent,
+      email_error: emailError,
+      message: emailSent
+        ? 'Portal invitation and email sent successfully.'
+        : 'Portal invitation link generated successfully.'
     });
   } catch (err) {
     console.error('customer portal invite error', err);
@@ -3820,5 +3971,7 @@ router.post('/customer-portal/auth/reset-password', async (req, res) => {
     return res.status(500).json({ error: 'Failed to reset password' });
   }
 });
+
+router.handlePortalAcceptInvite = handlePortalAcceptInvite;
 
 module.exports = router;
